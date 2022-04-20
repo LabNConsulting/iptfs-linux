@@ -22,3 +22,39 @@ obj-$(CONFIG_XFRM_IPCOMP) += xfrm_ipcomp.o
 obj-$(CONFIG_XFRM_INTERFACE) += xfrm_interface.o
 obj-$(CONFIG_XFRM_IPTFS) += xfrm_iptfs.o
 obj-$(CONFIG_XFRM_ESPINTCP) += espintcp.o
+
+GCOV_PROFILE_xfrm_iptfs.o := y
+# GCOV_PROFILE_xfrm_device.o := y
+# GCOV_PROFILE_xfrm_input.o := y
+# GCOV_PROFILE_xfrm_interface.o := y
+# GCOV_PROFILE_xfrm_output.o := y
+# GCOV_PROFILE_xfrm_policy.o := y
+# GCOV_PROFILE_xfrm_state.o := y
+# GCOV_PROFILE_xfrm_user.o := y
+
+CFLAGS_REMOVE_xfrm_algo.o = -g -O2
+CFLAGS_xfrm_algo.o = -g3 -O1
+
+CFLAGS_REMOVE_xfrm_device.o = -g -O2
+CFLAGS_xfrm_device.o = -g3 -O1
+
+CFLAGS_REMOVE_xfrm_interface.o = -g -O2
+CFLAGS_xfrm_interface.o = -g3 -O1
+
+CFLAGS_REMOVE_xfrm_input.o = -g -O2
+CFLAGS_xfrm_input.o = -g3 -O1
+
+CFLAGS_REMOVE_xfrm_iptfs.o = -g -O2
+CFLAGS_xfrm_iptfs.o = -g3 -O1
+
+CFLAGS_REMOVE_xfrm_output.o = -g -O2
+CFLAGS_xfrm_output.o = -g3 -O1
+
+CFLAGS_REMOVE_xfrm_policy.o = -g -O2
+CFLAGS_xfrm_policy.o = -g3 -O1
+
+CFLAGS_REMOVE_xfrm_state.o = -g -O2
+CFLAGS_xfrm_state.o = -g3 -O1
+
+CFLAGS_REMOVE_xfrm_user.o = -g -O2
+CFLAGS_xfrm_user.o = -g3 -O1
