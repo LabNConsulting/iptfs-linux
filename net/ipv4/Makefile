@@ -71,3 +71,16 @@ obj-$(CONFIG_XFRM) += xfrm4_policy.o xfrm4_state.o xfrm4_input.o \
 ifeq ($(CONFIG_BPF_JIT),y)
 obj-$(CONFIG_BPF_SYSCALL) += bpf_tcp_ca.o
 endif
+
+CFLAGS_REMOVE_esp4.o = -g -O2
+CFLAGS_esp4.o = -g3 -O1
+CFLAGS_REMOVE_xfrm4_input.o = -g -O2
+CFLAGS_xfrm4_input.o = -g3 -O1
+CFLAGS_REMOVE_xfrm4_output.o = -g -O2
+CFLAGS_xfrm4_output.o = -g3 -O1
+CFLAGS_REMOVE_xfrm4_policy.o = -g -O2
+CFLAGS_xfrm4_policy.o = -g3 -O1
+CFLAGS_REMOVE_xfrm4_protocol.o = -g -O2
+CFLAGS_xfrm4_protocol.o = -g3 -O1
+CFLAGS_REMOVE_xfrm4_state.o = -g -O2
+CFLAGS_xfrm4_state.o = -g3 -O1
