@@ -181,6 +181,11 @@ static struct sk_buff *xfrm4_outer_mode_gso_segment(struct xfrm_state *x,
 		return xfrm4_transport_gso_segment(x, skb, features);
 	case XFRM_MODE_BEET:
 		return xfrm4_beet_gso_segment(x, skb, features);
+#if 0
+	case XFRM_MODE_IPTFS:
+                /* XXX chopps: writeme */
+		return xfrm4_iptfs_gso_segment(x, skb, features);
+#endif
 	}
 
 	return ERR_PTR(-EOPNOTSUPP);

@@ -817,7 +817,8 @@ int esp_input_done2(struct sk_buff *skb, int err)
 	}
 
 	skb_pull_rcsum(skb, hlen);
-	if (x->props.mode == XFRM_MODE_TUNNEL)
+	if (x->props.mode == XFRM_MODE_TUNNEL ||
+	    x->props.mode == XFRM_MODE_IPTFS)
 		skb_reset_transport_header(skb);
 	else
 		skb_set_transport_header(skb, -ihl);
@@ -1157,6 +1158,10 @@ static int esp_init_state(struct xfrm_state *x)
 		x->props.header_len += sizeof(struct iphdr);
 	else if (x->props.mode == XFRM_MODE_BEET && x->sel.family != AF_INET6)
 		x->props.header_len += IPV4_BEET_PHMAXLEN;
+	else if (x->props.mode == XFRM_MODE_IPTFS) {
+		x->props.header_len +=
+			sizeof(struct iphdr) + sizeof(struct ip_iptfs_hdr);
+	}
 	if (x->encap) {
 		struct xfrm_encap_tmpl *encap = x->encap;
 

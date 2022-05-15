@@ -36,6 +36,7 @@
 #define XFRM_PROTO_AH		51
 #define XFRM_PROTO_COMP		108
 #define XFRM_PROTO_IPIP		4
+#define XFRM_PROTO_IPTFS	5
 #define XFRM_PROTO_IPV6		41
 #define XFRM_PROTO_ROUTING	IPPROTO_ROUTING
 #define XFRM_PROTO_DSTOPTS	IPPROTO_DSTOPTS
@@ -276,6 +277,9 @@ struct xfrm_state {
 	/* Private data of this transformer, format is opaque,
 	 * interpreted by xfrm_type methods. */
 	void			*data;
+
+	/* Data used by IPTFS mode*/
+	struct xfrm_iptfs_data	*tfs_data;
 };
 
 static inline struct net *xs_net(struct xfrm_state *x)
@@ -1702,6 +1706,7 @@ int km_report(struct net *net, u8 proto, struct xfrm_selector *sel,
 
 void xfrm_input_init(void);
 int xfrm_parse_spi(struct sk_buff *skb, u8 nexthdr, __be32 *spi, __be32 *seq);
+int xfrm_rcv_cb(struct sk_buff *skb, unsigned int family, u8 protocol, int err);
 
 void xfrm_probe_algs(void);
 int xfrm_count_pfkey_auth_supported(void);
@@ -2072,4 +2077,13 @@ static inline bool xfrm6_local_dontfrag(const struct sock *sk)
 	return false;
 }
 #endif
+
+#if IS_ENABLED(CONFIG_XFRM_IPTFS)
+int xfrm_iptfs_init_state(struct xfrm_state *x);
+int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
+		     struct sk_buff *skb);
+int xfrm_iptfs_output_collect(struct sk_buff *skb, struct sock *sk);
+void xfrm_iptfs_state_destroy(struct xfrm_state *x);
+#endif
+
 #endif	/* _NET_XFRM_H */

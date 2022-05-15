@@ -444,6 +444,11 @@ static const struct xfrm_mode xfrm4_mode_map[XFRM_MODE_MAX] = {
 		.flags = XFRM_MODE_FLAG_TUNNEL,
 		.family = AF_INET,
 	},
+	[XFRM_MODE_IPTFS] = {
+		.encap = XFRM_MODE_IPTFS,
+		.flags = XFRM_MODE_FLAG_TUNNEL,
+		.family = AF_INET,
+	},
 };
 
 static const struct xfrm_mode xfrm6_mode_map[XFRM_MODE_MAX] = {
@@ -462,6 +467,11 @@ static const struct xfrm_mode xfrm6_mode_map[XFRM_MODE_MAX] = {
 	},
 	[XFRM_MODE_TUNNEL] = {
 		.encap = XFRM_MODE_TUNNEL,
+		.flags = XFRM_MODE_FLAG_TUNNEL,
+		.family = AF_INET6,
+	},
+	[XFRM_MODE_IPTFS] = {
+		.encap = XFRM_MODE_IPTFS,
 		.flags = XFRM_MODE_FLAG_TUNNEL,
 		.family = AF_INET6,
 	},
@@ -500,6 +510,8 @@ EXPORT_SYMBOL(xfrm_state_free);
 
 static void ___xfrm_state_destroy(struct xfrm_state *x)
 {
+	if (x->props.mode == XFRM_MODE_IPTFS)
+		xfrm_iptfs_state_destroy(x);
 	hrtimer_cancel(&x->mtimer);
 	del_timer_sync(&x->rtimer);
 	kfree(x->aead);
@@ -1899,6 +1911,7 @@ static int __xfrm6_state_sort_cmp(const void *p)
 #endif
 	case XFRM_MODE_TUNNEL:
 	case XFRM_MODE_BEET:
+	case XFRM_MODE_IPTFS:
 		return 4;
 	}
 	return 5;
@@ -1925,6 +1938,7 @@ static int __xfrm6_tmpl_sort_cmp(const void *p)
 #endif
 	case XFRM_MODE_TUNNEL:
 	case XFRM_MODE_BEET:
+	case XFRM_MODE_IPTFS:
 		return 3;
 	}
 	return 4;
@@ -2599,6 +2613,7 @@ u32 xfrm_state_mtu(struct xfrm_state *x, int mtu)
 			net_adj = sizeof(struct ipv6hdr);
 		break;
 	case XFRM_MODE_TUNNEL:
+	case XFRM_MODE_IPTFS:
 		break;
 	default:
 		WARN_ON_ONCE(1);
@@ -2679,6 +2694,15 @@ int __xfrm_init_state(struct xfrm_state *x, bool init_replay, bool offload)
 			goto error;
 	}
 
+	if (x->props.mode == XFRM_MODE_IPTFS) {
+		/*
+		 * technically, the inner can be either; however, not sure the
+		 * xfrm stack supports this.
+		 */
+		/* x->inner_mode.family = AF_UNSPEC; */
+		if ((err = xfrm_iptfs_init_state(x)))
+			goto error;
+	}
 error:
 	return err;
 }

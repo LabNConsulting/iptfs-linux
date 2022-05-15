@@ -275,6 +275,7 @@ static int verify_newsa_info(struct xfrm_usersa_info *p,
 	case XFRM_MODE_TUNNEL:
 	case XFRM_MODE_ROUTEOPTIMIZATION:
 	case XFRM_MODE_BEET:
+	case XFRM_MODE_IPTFS:
 		break;
 
 	default:
@@ -1623,6 +1624,7 @@ static int validate_tmpl(int nr, struct xfrm_user_tmpl *ut, u16 family)
 		switch (ut[i].mode) {
 		case XFRM_MODE_TUNNEL:
 		case XFRM_MODE_BEET:
+		case XFRM_MODE_IPTFS:
 			break;
 		default:
 			if (ut[i].family != prev_family)
