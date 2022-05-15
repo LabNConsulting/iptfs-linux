@@ -21,6 +21,11 @@
 # define __BUG_REL(val)	".long " __stringify(val) " - 2b"
 #endif
 
+#ifdef __IN_CCLS__
+#define _BUG_FLAGS(ins, flags, extra)                                          \
+	panic("BUG: file: %s line %d flags 0x%x", __FILE__, __LINE__, flags);
+// panic("BUG: file: %s line %d", __FILE__, __LINE__);
+#else
 #ifdef CONFIG_DEBUG_BUGVERBOSE
 
 #define _BUG_FLAGS(ins, flags, extra)					\
@@ -55,6 +60,7 @@ do {									\
 } while (0)
 
 #endif /* CONFIG_DEBUG_BUGVERBOSE */
+#endif /* 1 */
 
 #else
 
