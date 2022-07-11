@@ -9,13 +9,12 @@
  */
 
 #include <linux/kernel.h>
-#include <net/xfrm.h>
+#include <net/icmp.h>
+#include <net/inet_ecn.h>
 #include <net/iptfs.h>
+#include <net/xfrm.h>
 
 #include "xfrm_inout.h"
-
-/* Use tasklet or hrtimer for collecting tunnel ingress packets */
-#undef XFRM_IPTFS_USE_TASKLET
 
 #define NSECS_IN_USECS 1000
 #define NSECS_IN_MSECS (NSECS_IN_USECS * 1000)
@@ -32,20 +31,12 @@
 struct xfrm_iptfs_data {
 	struct xfrm_state *x; /* owning state */
 	struct sk_buff_head delay_queue;
-#if IS_ENABLED(XFRM_IPTFS_USE_TASKLET)
-	struct tasklet_struct delay_tasklet;
-#else
 	struct hrtimer iptfs_timer;
-#endif
 	spinlock_t iptfs_lock;
 	time64_t iptfs_settime;
 };
 
-#if IS_ENABLED(XFRM_IPTFS_USE_TASKLET)
-static void xfrm_iptfs_output_queued(struct tasklet_struct *t);
-#else
 static enum hrtimer_restart xfrm_iptfs_delay_timer(struct hrtimer *me);
-#endif
 
 /* ----------------- */
 /* Utility Functions */
@@ -84,19 +75,17 @@ int xfrm_iptfs_init_state(struct xfrm_state *x)
 	struct xfrm_iptfs_data *xtfs;
 
 	xtfs = kzalloc_node(sizeof(*xtfs), GFP_KERNEL, NUMA_NO_NODE);
-	if (!(x->tfs_data = xtfs))
+	x->tfs_data = xtfs;
+	if (!xtfs)
 		return -ENOMEM;
 
 	xtfs->x = x;
 	__skb_queue_head_init(&xtfs->delay_queue);
 	spin_lock_init(&xtfs->iptfs_lock);
-#if IS_ENABLED(XFRM_IPTFS_USE_TASKLET)
-	tasklet_setup(&xtfs->delay_tasklet, xfrm_iptfs_output_queued);
-#else
 	hrtimer_init(&xtfs->iptfs_timer, CLOCK_MONOTONIC,
 		     HRTIMER_MODE_REL_SOFT);
 	xtfs->iptfs_timer.function = xfrm_iptfs_delay_timer;
-#endif
+
 	return 0;
 }
 
@@ -492,9 +481,6 @@ int xfrm_iptfs_output_collect(struct sk_buff *skb, struct sock *sk)
 	pr_devinf("%s: skb: %p len %u icmpseq %u dst_mtu() => %d\n", __func__,
 		  skb, (uint)skb->len, icmpseq(skb), (int)dst_mtu(dst));
 
-#if IS_ENABLED(XFRM_IPTFS_USE_TASKLET)
-	tasklet_schedule(&x->delay_tasklet);
-#else
 	/* Start a delay timer if we don't have one yet */
 	if (!hrtimer_is_queued(&xtfs->iptfs_timer)) {
 		pr_devinf("%s: starting hrtimer\n", __func__);
@@ -502,7 +488,7 @@ int xfrm_iptfs_output_collect(struct sk_buff *skb, struct sock *sk)
 			      HRTIMER_MODE_REL_SOFT);
 		xtfs->iptfs_settime = ktime_get_raw_fast_ns();
 	}
-#endif
+
 	spin_unlock(&x->lock);
 	return 0;
 }
@@ -630,33 +616,6 @@ static void __xfrm_iptfs_output_queued(struct xfrm_state *x,
 	}
 }
 
-#if IS_ENABLED(XFRM_IPTFS_USE_TASKLET)
-static void xfrm_iptfs_output_queued(struct tasklet_struct *t)
-{
-	struct sk_buff_head list;
-	struct xfrm_iptfs_data *xtfs;
-	struct xfrm_state *x;
-
-	xtfs = container_of(t, typeof(*xtfs), delay_tasklet);
-	x = xtfs->x;
-
-	spin_lock(&x->lock);
-	/* XXX only send packets when we have more than 1 for testing */
-	if (xtfs->delay_queue.qlen < 2) {
-		spin_unlock(&x->lock);
-		return;
-	}
-	__skb_queue_head_init(&list);
-	skb_queue_splice_init(&xtfs->delay_queue, &list);
-	spin_unlock(&x->lock);
-
-	/*
-         * Any particular tasklet is not run concurrently with itself, no lock
-         * needed for to keep transmit order here.
-         */
-	__xfrm_iptfs_output_queued(x, &list);
-}
-#else
 static enum hrtimer_restart xfrm_iptfs_delay_timer(struct hrtimer *me)
 {
 	struct sk_buff_head list;
@@ -688,4 +647,3 @@ static enum hrtimer_restart xfrm_iptfs_delay_timer(struct hrtimer *me)
 
 	return HRTIMER_NORESTART;
 }
-#endif
