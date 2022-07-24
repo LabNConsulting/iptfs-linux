@@ -2082,7 +2082,9 @@ static inline bool xfrm6_local_dontfrag(const struct sock *sk)
 int xfrm_iptfs_init_state(struct xfrm_state *x);
 int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 		     struct sk_buff *skb);
-int xfrm_iptfs_output_collect(struct sk_buff *skb, struct sock *sk);
+int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
+			      struct sk_buff *skb);
+
 void xfrm_iptfs_state_destroy(struct xfrm_state *x);
 #endif
 
