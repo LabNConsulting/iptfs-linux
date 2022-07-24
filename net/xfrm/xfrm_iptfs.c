@@ -564,6 +564,8 @@ static void __xfrm_iptfs_output_queued(struct xfrm_state *x,
 		remaining -= skb->len;
 
 		nextp = &skb_shinfo(skb)->frag_list;
+		while (*nextp)
+			nextp = &(skb_shinfo(*nextp))->frag_list;
 
 		/* XXX should peek first to see if we have MTU room to append */
 		while ((skb2 = skb_peek(list)) && skb2->len <= remaining) {
