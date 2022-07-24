@@ -71,8 +71,6 @@ static int __xfrm6_output(struct net *net, struct sock *sk, struct sk_buff *skb)
 		return dst_output(net, sk, skb);
 	}
 #endif
-	if (x->props.mode == XFRM_MODE_IPTFS)
-		return xfrm_iptfs_output_collect(skb, sk);
 
 	if (x->props.mode != XFRM_MODE_TUNNEL)
 		goto skip_frag;

@@ -460,7 +460,8 @@ done:
  * IPv4/IPv6 packet ingress to IPTFS tunnel, arrange to send in IPTFS payload
  * (i.e., aggregating or fragmenting as appropriate).
  */
-int xfrm_iptfs_output_collect(struct sk_buff *skb, struct sock *sk)
+int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
+			      struct sk_buff *skb)
 {
 	struct dst_entry *dst = skb_dst(skb);
 	struct xfrm_state *x = dst->xfrm;
