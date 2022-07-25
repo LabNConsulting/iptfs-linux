@@ -37,6 +37,7 @@
 #define XFRM_PROTO_COMP		108
 #define XFRM_PROTO_IPIP		4
 #define XFRM_PROTO_IPV6		41
+#define XFRM_PROTO_IPTFS	IPPROTO_AGGFRAG
 #define XFRM_PROTO_ROUTING	IPPROTO_ROUTING
 #define XFRM_PROTO_DSTOPTS	IPPROTO_DSTOPTS
 
@@ -289,6 +290,9 @@ struct xfrm_state {
 	/* Private data of this transformer, format is opaque,
 	 * interpreted by xfrm_type methods. */
 	void			*data;
+
+	/* Data used by IPTFS mode*/
+	struct xfrm_iptfs_data	*tfs_data;
 };
 
 static inline struct net *xs_net(struct xfrm_state *x)
@@ -2192,6 +2196,18 @@ extern struct gro_cells *xfrm_input_gro_cells;
 #define XFRM_IPTFS_DEFAULT_INIT_DELAY_USECS (0)
 #define XFRM_IPTFS_DEFAULT_DROP_TIME_USECS (1000000)
 #define XFRM_IPTFS_DEFAULT_REORDER_WINDOW (3)
+
+int xfrm_iptfs_copy_to_user_state(struct xfrm_state *x, struct sk_buff *skb);
+
+int xfrm_iptfs_user_init(struct net *net, struct xfrm_state *x,
+			 struct nlattr **attrs);
+int xfrm_iptfs_init_state(struct xfrm_state *x);
+int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
+		     struct sk_buff *skb);
+int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
+			      struct sk_buff *skb);
+
+void xfrm_iptfs_state_destroy(struct xfrm_state *x);
 #endif
 
 #endif	/* _NET_XFRM_H */
