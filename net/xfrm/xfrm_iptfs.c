@@ -21,9 +21,12 @@
 
 #define XFRM_IPTFS_DELAY_NSECS (200 * NSECS_IN_MSECS)
 
+/* maximum depth of queue for aggregating */
+#define XFRM_IPTFS_MAX_QUEUE_SIZE (1500 * 129)
+
 #undef PR_DEBUG_INFO
 #ifdef PR_DEBUG_INFO
-#define pr_devinf(...) pr_nVA_ARGS__)
+#define pr_devinf(...) pr_debug(__VA_ARGS__)
 #else
 #define pr_devinf(...)
 #endif
@@ -31,6 +34,7 @@
 struct xfrm_iptfs_data {
 	struct xfrm_state *x; /* owning state */
 	struct sk_buff_head delay_queue;
+	size_t delay_queue_size;
 	struct hrtimer iptfs_timer;
 	spinlock_t iptfs_lock;
 	time64_t iptfs_settime;
@@ -457,6 +461,27 @@ done:
 /* --------------------------------- */
 
 /*
+ * Check to see if it's OK to queue a packet for sending on tunnel, lock must be
+ * held.
+ */
+static bool __xfrm_itpfs_enqueue(struct xfrm_iptfs_data *xtfs,
+				 struct sk_buff *skb)
+{
+	/* For now we use a predefined constant value, eventually configuration */
+	if (xtfs->delay_queue_size + skb->len > XFRM_IPTFS_MAX_QUEUE_SIZE) {
+		pr_warn_ratelimited(
+			"%s: no space: qsize: %u skb len %u max %u\n", __func__,
+			(uint)xtfs->delay_queue_size, (uint)skb->len,
+			(uint)XFRM_IPTFS_MAX_QUEUE_SIZE);
+		kfree_skb(skb);
+		return false;
+	}
+	__skb_queue_tail(&xtfs->delay_queue, skb);
+	xtfs->delay_queue_size += skb->len;
+	return true;
+}
+
+/*
  * IPv4/IPv6 packet ingress to IPTFS tunnel, arrange to send in IPTFS payload
  * (i.e., aggregating or fragmenting as appropriate).
  */
@@ -475,7 +500,9 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 
 	/* can be running on multiple cores */
 	spin_lock(&x->lock);
-	__skb_queue_tail(&xtfs->delay_queue, skb);
+
+	if (!__xfrm_itpfs_enqueue(xtfs, skb))
+		goto done;
 
 	// if (skb->protocol == htons(ETH_P_IPV6))
 	// mtu = ip6_skb_dst_mtu(skb);
@@ -490,6 +517,7 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 		xtfs->iptfs_settime = ktime_get_raw_fast_ns();
 	}
 
+done:
 	spin_unlock(&x->lock);
 	return 0;
 }
@@ -638,6 +666,7 @@ static enum hrtimer_restart xfrm_iptfs_delay_timer(struct hrtimer *me)
 	spin_lock(&x->lock);
 	__skb_queue_head_init(&list);
 	skb_queue_splice_init(&xtfs->delay_queue, &list);
+	xtfs->delay_queue_size = 0;
 	settime = xtfs->iptfs_settime;
 	spin_unlock(&x->lock);
 
