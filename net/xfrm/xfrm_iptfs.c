@@ -16,6 +16,7 @@
 
 #include "xfrm_inout.h"
 
+#define XFRM_IPTFS_MIN_HEADROOM 128
 #define NSECS_IN_USECS 1000
 #define NSECS_IN_MSECS (NSECS_IN_USECS * 1000)
 
@@ -175,6 +176,8 @@ struct sk_buff *pskb_extract_seq(struct skb_seq_state *st, uint off, int len,
 	skb = alloc_skb(len + resv, GFP_ATOMIC);
 	if (!skb)
 		return NULL;
+	skb_reserve(skb, resv);
+
 	skb->csum = 0;
 	skb_copy_header(skb, st->root_skb);
 	// the skb_copy_header does the following so figure out wth it is :)
@@ -314,6 +317,8 @@ int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 			first_skb = skb;
 			first_iplen = iplen;
 			resv = skb_headroom(skb);
+			if (resv < XFRM_IPTFS_MIN_HEADROOM)
+				resv = XFRM_IPTFS_MIN_HEADROOM;
 
 			if (!skb_is_nonlinear(skb)) {
 				/* since reusing skb move past the IPTFS header */
