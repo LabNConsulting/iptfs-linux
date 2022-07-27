@@ -26,9 +26,9 @@
 
 #undef PR_DEBUG_INFO
 #ifdef PR_DEBUG_INFO
-#define pr_devinf(...) pr_debug(__VA_ARGS__)
+#define pr_devinf(...) pr_info(__VA_ARGS__)
 #else
-#define pr_devinf(...)
+#define pr_devinf(...) pr_devel(__VA_ARGS__)
 #endif
 
 struct xfrm_iptfs_data {
@@ -653,6 +653,7 @@ static enum hrtimer_restart xfrm_iptfs_delay_timer(struct hrtimer *me)
 	struct xfrm_iptfs_data *xtfs;
 	struct xfrm_state *x;
 	time64_t settime;
+	size_t osize;
 
 	xtfs = container_of(me, typeof(*xtfs), iptfs_timer);
 	x = xtfs->x;
@@ -666,10 +667,13 @@ static enum hrtimer_restart xfrm_iptfs_delay_timer(struct hrtimer *me)
 	spin_lock(&x->lock);
 	__skb_queue_head_init(&list);
 	skb_queue_splice_init(&xtfs->delay_queue, &list);
+	osize = xtfs->delay_queue_size;
 	xtfs->delay_queue_size = 0;
 	settime = xtfs->iptfs_settime;
 	spin_unlock(&x->lock);
 
+	pr_devinf("%s: got %u packets of %u total len\n", __func__,
+		  (uint)list.qlen, (uint)osize);
 	pr_devinf("%s: time delta %llu\n", __func__,
 		  (unsigned long long)(ktime_get_raw_fast_ns() - settime));
 
