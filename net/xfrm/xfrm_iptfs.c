@@ -163,6 +163,8 @@ int skb_copy_bits_seq(struct skb_seq_state *st, int offset, void *to, int len)
 			return 0;
 		}
 		memcpy(to, data, sqlen);
+                to += sqlen;
+                offset += sqlen;
 		len -= sqlen;
 	}
 }
@@ -436,7 +438,7 @@ int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 	}
 
 	if (first_skb && first_iplen && !defer) {
-		if (pskb_trim_rcsum(skb, first_iplen)) {
+		if (pskb_trim_rcsum(first_skb, first_iplen)) {
 			/* error trimming */
 			list_del(&first_skb->list);
 			defer = first_skb;
