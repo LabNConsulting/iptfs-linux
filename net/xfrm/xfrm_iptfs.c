@@ -200,7 +200,6 @@ struct sk_buff *pskb_extract_seq(struct skb_seq_state *st, uint off, int len,
 	return skb;
 }
 EXPORT_SYMBOL(pskb_extract_seq);
-
 /*
  * We have an IPTFS payload dispense with it and this skb as well.
  */
@@ -328,7 +327,7 @@ int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 			if (resv < XFRM_IPTFS_MIN_HEADROOM)
 				resv = XFRM_IPTFS_MIN_HEADROOM;
 
-			if (!skb_is_nonlinear(skb)) {
+			if (0 && !skb_is_nonlinear(skb)) {
 				/* since reusing skb move past the IPTFS header */
 				pskb_pull(skb, data);
 

@@ -724,6 +724,7 @@ static inline int esp_remove_trailer(struct sk_buff *skb)
 	if (padlen + 2 + alen >= elen) {
 		net_dbg_ratelimited("ipsec esp packet is garbage padlen=%d, elen=%d\n",
 				    padlen + 2, elen - alen);
+		printk("%s: ESP CRAP\n", __func__);
 		goto out;
 	}
 
@@ -753,12 +754,16 @@ int esp_input_done2(struct sk_buff *skb, int err)
 	if (!xo || !(xo->flags & CRYPTO_DONE))
 		kfree(ESP_SKB_CB(skb)->tmp);
 
-	if (unlikely(err))
+	if (unlikely(err)) {
+		printk("%s: err %d\n", __func__, err);
 		goto out;
+	}
 
 	err = esp_remove_trailer(skb);
-	if (unlikely(err < 0))
+	if (unlikely(err < 0)) {
+		printk("%s: err2 %d\n", __func__, err);
 		goto out;
+	}
 
 	iph = ip_hdr(skb);
 	ihl = iph->ihl * 4;
@@ -828,6 +833,10 @@ int esp_input_done2(struct sk_buff *skb, int err)
 		err = -EINVAL;
 
 out:
+	if (err)
+		printk("%s: ERR3 %d\n", __func__, err);
+	else
+		printk("%s: proto %d\n", __func__, err);
 	return err;
 }
 EXPORT_SYMBOL_GPL(esp_input_done2);
@@ -891,11 +900,17 @@ static int esp_input(struct xfrm_state *x, struct sk_buff *skb)
 	struct scatterlist *sg;
 	int err = -EINVAL;
 
-	if (!pskb_may_pull(skb, sizeof(struct ip_esp_hdr) + ivlen))
-		goto out;
+	printk("%s: receive skblen %u\n", __func__, skb->len);
 
-	if (elen <= 0)
+	if (!pskb_may_pull(skb, sizeof(struct ip_esp_hdr) + ivlen)) {
+		printk("%s: receive bad may_pull %d\n", __func__, err);
 		goto out;
+	}
+
+	if (elen <= 0) {
+		printk("%s: receive bad elen %d\n", __func__, err);
+		goto out;
+	}
 
 	assoclen = sizeof(struct ip_esp_hdr);
 	seqhilen = 0;
@@ -919,16 +934,20 @@ static int esp_input(struct xfrm_state *x, struct sk_buff *skb)
 	}
 
 	err = skb_cow_data(skb, 0, &trailer);
-	if (err < 0)
+	if (err < 0) {
+		printk("%s: receive bad skb_cow_data %d\n", __func__, err);
 		goto out;
+	}
 
 	nfrags = err;
 
 skip_cow:
 	err = -ENOMEM;
 	tmp = esp_alloc_tmp(aead, nfrags, seqhilen);
-	if (!tmp)
+	if (!tmp) {
+		printk("%s: receive bad esp_alloc_tmp %d\n", __func__, err);
 		goto out;
+	}
 
 	ESP_SKB_CB(skb)->tmp = tmp;
 	seqhi = esp_tmp_extra(tmp);
@@ -941,6 +960,7 @@ skip_cow:
 	sg_init_table(sg, nfrags);
 	err = skb_to_sgvec(skb, sg, 0, skb->len);
 	if (unlikely(err < 0)) {
+		printk("%s: receive bad sgvec %d\n", __func__, err);
 		kfree(tmp);
 		goto out;
 	}
@@ -965,6 +985,10 @@ skip_cow:
 	err = esp_input_done2(skb, err);
 
 out:
+	if (err < 0)
+		printk("%s: receive out ERROR %d\n", __func__, err);
+	else
+		printk("%s: receive out proto %d\n", __func__, err);
 	return err;
 }
 
