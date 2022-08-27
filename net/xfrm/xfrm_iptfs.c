@@ -20,7 +20,9 @@
 #define NSECS_IN_USECS 1000
 #define NSECS_IN_MSECS (NSECS_IN_USECS * 1000)
 
-#define XFRM_IPTFS_DELAY_NSECS (200 * NSECS_IN_MSECS)
+/* #define IPTFS_ENET_OHEAD (14 + 4 + 8 + 12) */
+/* #define GE_PPS(ge, iptfs_ip_mtu) ((1e8 * 10 ^ (ge - 1) / 8) / (iptfs_ip_mtu)) */
+#define XFRM_IPTFS_DELAY_NSECS (20 * NSECS_IN_USECS)
 
 /* maximum depth of queue for aggregating */
 #define XFRM_IPTFS_MAX_QUEUE_SIZE (1500 * 129)
