@@ -213,6 +213,7 @@ int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 	struct skb_seq_state skbseq;
 	struct list_head sublist;
 	struct ip_iptfs_hdr *ipth = (struct ip_iptfs_hdr *)&iptcch;
+	const unsigned char *old_mac;
 	struct iphdr *iph;
 	uint data, tail;
 	struct sk_buff *next;
@@ -237,6 +238,9 @@ int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 	tail = skb->len;
 	remaining = tail - data;
 	skb_prepare_seq_read(skb, data, tail, &skbseq);
+
+	/* Save the old mac header if set */
+	old_mac = skb_mac_header_was_set(skb) ? skb_mac_header(skb) : NULL;
 
 	/*
 	 * Get the IPTFS header and validate it
@@ -326,6 +330,8 @@ int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 				/* since reusing skb move past the IPTFS header */
 				pskb_pull(skb, data);
 
+				skb_mac_header_rebuild(skb);
+
 				/* our range just changed */
 				data = 0;
 				tail = skb->len;
@@ -371,13 +377,18 @@ int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 				kfree_skb(skb);
 				continue;
 			}
+
+			if (old_mac) {
+				/* rebuild the mac header */
+				skb_set_mac_header(skb, -first_skb->mac_len);
+				memcpy(skb_mac_header(skb), old_mac,
+				       first_skb->mac_len);
+			}
 		}
 		pr_devinf("%s: skb %p icmpseq %u\n", __func__, skb,
 			  icmpseq(skb));
 
 		skb_reset_network_header(skb);
-
-		/* XXX is this important? */
 		skb_set_transport_header(skb, iphlen);
 
 		/* point iph at the actual header rather than hbytes */
