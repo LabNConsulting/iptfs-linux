@@ -511,6 +511,22 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 	struct xfrm_state *x = dst->xfrm;
 	struct xfrm_iptfs_data *xtfs = x->tfs_data;
 
+	/*
+	 * We have hooked into dst_entry->output which means we have skipped the
+	 * protocol specific netfilter (see xfrm4_output, xfrm6_output).
+	 * when our timer runs we will end up calling xfrm_output directly on
+	 * the encapsulated traffic.
+	 *
+	 * For both cases this is the NF_INET_POST_ROUTING hook which allows
+	 * changing the skb->dst entry which then may not be xfrm based anymore
+	 * in which case a REROUTED flag is set. and dst_output is called.
+	 *
+	 * For IPv6 we are also skipping fragmentation handling for local
+	 * sockets, which may or may not be good depending on our tunnel DF
+	 * setting. Normally with fragmentation supported we want to skip this
+	 * fragmentation.
+	 */
+
 	BUG_ON(xtfs == NULL);
 
 	/* not sure what the sock is used for here */
@@ -595,6 +611,38 @@ static int xfrm_iptfs_first_skb(struct sk_buff *skb)
 static void __xfrm_iptfs_output_queued(struct xfrm_state *x,
 				       struct sk_buff_head *list)
 {
+	/*
+	 * Our code path skips xfrm[46]_extract_output b/c we may have multiple
+	 * internal packets; however! we can do whatever collection of
+	 * flags/mapping values we want here. (see: xfrm[46]_extract_header)
+	 *
+	 * what gets saved:
+	 *
+	 * XFRM_MODE_SKB_CB(skb)->protocol = ip_hdr(skb)->protocol;
+	 * const struct iphdr *iph = ip_hdr(skb);
+	 * XFRM_MODE_SKB_CB(skb)->ihl = sizeof(*iph);
+	 * XFRM_MODE_SKB_CB(skb)->id = iph->id;
+	 * XFRM_MODE_SKB_CB(skb)->frag_off = iph->frag_off;
+	 * XFRM_MODE_SKB_CB(skb)->tos = iph->tos;
+	 * XFRM_MODE_SKB_CB(skb)->ttl = iph->ttl;
+	 * XFRM_MODE_SKB_CB(skb)->optlen = iph->ihl * 4 - sizeof(*iph);
+	 * memset(XFRM_MODE_SKB_CB(skb)->flow_lbl, 0,
+	 * sizeof(XFRM_MODE_SKB_CB(skb)->flow_lbl));
+	 *
+	 * or
+	 *
+	 * XFRM_MODE_SKB_CB(skb)->protocol = ipv6_hdr(skb)->nexthdr;
+	 * XFRM_MODE_SKB_CB(skb)->ihl = sizeof(*iph);
+	 * XFRM_MODE_SKB_CB(skb)->id = 0;
+	 * XFRM_MODE_SKB_CB(skb)->frag_off = htons(IP_DF);
+	 * XFRM_MODE_SKB_CB(skb)->tos = ipv6_get_dsfield(iph);
+	 * XFRM_MODE_SKB_CB(skb)->ttl = iph->hop_limit;
+	 * XFRM_MODE_SKB_CB(skb)->optlen = 0;
+	 * memcpy(XFRM_MODE_SKB_CB(skb)->flow_lbl, iph->flow_lbl,
+	 * sizeof(XFRM_MODE_SKB_CB(skb)->flow_lbl));
+	 *
+	 */
+
 	struct sk_buff *skb, *skb2, **nextp;
 	int err;
 
