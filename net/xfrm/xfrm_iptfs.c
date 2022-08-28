@@ -512,6 +512,22 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 	struct xfrm_state *x = dst->xfrm;
 	struct xfrm_iptfs_data *xtfs = x->tfs_data;
 
+	/*
+	 * We have hooked into dst_entry->output which means we have skipped the
+	 * protocol specific netfilter (see xfrm4_output, xfrm6_output).
+	 * when our timer runs we will end up calling xfrm_output directly on
+	 * the encapsulated traffic.
+	 *
+	 * For both cases this is the NF_INET_POST_ROUTING hook which allows
+	 * changing the skb->dst entry which then may not be xfrm based anymore
+	 * in which case a REROUTED flag is set. and dst_output is called.
+	 *
+	 * For IPv6 we are also skipping fragmentation handling for local
+	 * sockets, which may or may not be good depending on our tunnel DF
+	 * setting. Normally with fragmentation supported we want to skip this
+	 * fragmentation.
+	 */
+
 	BUG_ON(xtfs == NULL);
 
 	/* not sure what the sock is used for here */
@@ -596,6 +612,78 @@ static int xfrm_iptfs_first_skb(struct sk_buff *skb)
 static void __xfrm_iptfs_output_queued(struct xfrm_state *x,
 				       struct sk_buff_head *list)
 {
+	/*
+	 * When we do timed output things (locking) will be more complex in the
+	 * presence of fragmentation. But maybe more efficient since there
+	 * shouldn't be any contention due to the pacing timer being regularly
+	 * spaced.
+	 */
+
+	/*
+	 * For now we are just outputting packets as fast as we can, so if we
+	 * are fragmenting we will do so until the last inner packet is complete,
+	 * Then we just send the last packet padded -- or perhaps check if this
+	 * callback's timer has been reset and is sufficiently soon we can
+	 * save this final packet to be used by the next timer fire.
+	 *
+	 * We do not need to lock the put-back packet as we only manipulate this
+	 * field in this function.
+	 *
+	 * The case is exactly the same when not fragmenting, we either send the
+	 * last outer packet padded or delay for a soon to fire reset timer.
+	 */
+
+	/*
+	 * When we do timed packets *and* fragmentation we need to output all packets that contain
+	 * the fragments of a single inner packet, consecutively. So we have to
+	 * have a lock to keep another CPU from grabbing the next batch of
+	 * packets (it's `list`) and trying to output those, while we try to
+	 * output our `list`. IOW there can only be one cpu outputting packets
+	 * for a given SA at a given time. Thus we need to lock the IPTFS output
+	 * on a per SA basis while we process this list.
+	 */
+
+	/*
+	 * NOTE: for the future, for timed packet sends, if our queue is not
+	 * growing longer (i.e., we are keeping up) and a packet we are about to
+	 * fragment will not fragment in then next outer packet, we might consider
+	 * holding on to it to send whole in the next slot. The question then is
+	 * does this introduce a continuous delay in the inner packet stream
+	 * with certain packet rates and sizes?
+	 */
+
+	/*
+	 * Our code path skips xfrm[46]_extract_output b/c we may have multiple
+	 * internal packets; however! we can do whatever collection of
+	 * flags/mapping values we want here. (see: xfrm[46]_extract_header)
+	 *
+	 * what gets saved:
+	 *
+	 * XFRM_MODE_SKB_CB(skb)->protocol = ip_hdr(skb)->protocol;
+	 * const struct iphdr *iph = ip_hdr(skb);
+	 * XFRM_MODE_SKB_CB(skb)->ihl = sizeof(*iph);
+	 * XFRM_MODE_SKB_CB(skb)->id = iph->id;
+	 * XFRM_MODE_SKB_CB(skb)->frag_off = iph->frag_off;
+	 * XFRM_MODE_SKB_CB(skb)->tos = iph->tos;
+	 * XFRM_MODE_SKB_CB(skb)->ttl = iph->ttl;
+	 * XFRM_MODE_SKB_CB(skb)->optlen = iph->ihl * 4 - sizeof(*iph);
+	 * memset(XFRM_MODE_SKB_CB(skb)->flow_lbl, 0,
+	 * sizeof(XFRM_MODE_SKB_CB(skb)->flow_lbl));
+	 *
+	 * or
+	 *
+	 * XFRM_MODE_SKB_CB(skb)->protocol = ipv6_hdr(skb)->nexthdr;
+	 * XFRM_MODE_SKB_CB(skb)->ihl = sizeof(*iph);
+	 * XFRM_MODE_SKB_CB(skb)->id = 0;
+	 * XFRM_MODE_SKB_CB(skb)->frag_off = htons(IP_DF);
+	 * XFRM_MODE_SKB_CB(skb)->tos = ipv6_get_dsfield(iph);
+	 * XFRM_MODE_SKB_CB(skb)->ttl = iph->hop_limit;
+	 * XFRM_MODE_SKB_CB(skb)->optlen = 0;
+	 * memcpy(XFRM_MODE_SKB_CB(skb)->flow_lbl, iph->flow_lbl,
+	 * sizeof(XFRM_MODE_SKB_CB(skb)->flow_lbl));
+	 *
+	 */
+
 	struct sk_buff *skb, *skb2, **nextp;
 	int err;
 
