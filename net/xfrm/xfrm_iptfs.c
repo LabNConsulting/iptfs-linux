@@ -39,7 +39,6 @@ struct xfrm_iptfs_data {
 	struct sk_buff_head delay_queue;
 	size_t delay_queue_size;
 	struct hrtimer iptfs_timer;
-	spinlock_t iptfs_lock;
 	time64_t iptfs_settime;
 };
 
@@ -88,7 +87,6 @@ int xfrm_iptfs_init_state(struct xfrm_state *x)
 
 	xtfs->x = x;
 	__skb_queue_head_init(&xtfs->delay_queue);
-	spin_lock_init(&xtfs->iptfs_lock);
 	hrtimer_init(&xtfs->iptfs_timer, CLOCK_MONOTONIC,
 		     HRTIMER_MODE_REL_SOFT);
 	xtfs->iptfs_timer.function = xfrm_iptfs_delay_timer;
@@ -481,19 +479,19 @@ done:
 /* --------------------------------- */
 
 /*
- * Check to see if it's OK to queue a packet for sending on tunnel, lock must be
- * held.
+ * Check to see if it's OK to queue a packet for sending on tunnel.
  */
 static bool __xfrm_itpfs_enqueue(struct xfrm_iptfs_data *xtfs,
 				 struct sk_buff *skb)
 {
+	assert_spin_locked(&xtfs->x->lock);
+
 	/* For now we use a predefined constant value, eventually configuration */
 	if (xtfs->delay_queue_size + skb->len > XFRM_IPTFS_MAX_QUEUE_SIZE) {
 		pr_warn_ratelimited(
 			"%s: no space: qsize: %u skb len %u max %u\n", __func__,
 			(uint)xtfs->delay_queue_size, (uint)skb->len,
 			(uint)XFRM_IPTFS_MAX_QUEUE_SIZE);
-		kfree_skb(skb);
 		return false;
 	}
 	__skb_queue_tail(&xtfs->delay_queue, skb);
@@ -534,11 +532,15 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 	/* This will be set if we do a local ping! */
 	// WARN_ON(sk != NULL);
 
-	/* can be running on multiple cores */
-	spin_lock(&x->lock);
+	/* We can be running on multiple cores or from user context */
+	spin_lock_bh(&x->lock);
 
-	if (!__xfrm_itpfs_enqueue(xtfs, skb))
-		goto done;
+	if (!__xfrm_itpfs_enqueue(xtfs, skb)) {
+		kfree_skb(skb);
+		BUG_ON(xtfs->delay_queue_size &&
+		       !hrtimer_is_queued(&xtfs->iptfs_timer));
+		goto out;
+	}
 
 	// if (skb->protocol == htons(ETH_P_IPV6))
 	// mtu = ip6_skb_dst_mtu(skb);
@@ -548,13 +550,15 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 	/* Start a delay timer if we don't have one yet */
 	if (!hrtimer_is_queued(&xtfs->iptfs_timer)) {
 		pr_devinf("%s: starting hrtimer\n", __func__);
+		/* softirq blocked lest the timer fire and interrupt us */
+		BUG_ON(!in_interrupt());
+		// HRTIMER_MODE_REL_PINNED_HARD?
 		hrtimer_start(&xtfs->iptfs_timer, XFRM_IPTFS_DELAY_NSECS,
 			      HRTIMER_MODE_REL_SOFT);
-		xtfs->iptfs_settime = ktime_get_raw_fast_ns();
 	}
-
-done:
-	spin_unlock(&x->lock);
+out:
+	xtfs->iptfs_settime = ktime_get_raw_fast_ns();
+	spin_unlock_bh(&x->lock);
 	return 0;
 }
 
@@ -767,11 +771,14 @@ static enum hrtimer_restart xfrm_iptfs_delay_timer(struct hrtimer *me)
 	x = xtfs->x;
 
 	/*
+	 * Process all the queued packets
+	 *
          * softirq execution order: timer > tasklet > hrtimer
          *
          * Network rx will have run before us giving one last chance to queue
          * ingress packets for us to process and transmit.
          */
+
 	spin_lock(&x->lock);
 	__skb_queue_head_init(&list);
 	skb_queue_splice_init(&xtfs->delay_queue, &list);
@@ -780,14 +787,24 @@ static enum hrtimer_restart xfrm_iptfs_delay_timer(struct hrtimer *me)
 	settime = xtfs->iptfs_settime;
 	spin_unlock(&x->lock);
 
+	/*
+	 * After the above unlock, packets can begin queuing again, and the
+	 * timer can be set again, from another CPU either in softirq or user
+	 * context (not from this one since we are running at softirq level
+	 * already).
+	 *
+	 * XXX verify that a timer callback doesn't need to be re-entrant, i.e.,
+	 * that it will never be running concurrently on different CPUs.
+	 * If we have to be re-entrant we probably want a lock to avoid
+	 * spewing packets out of order.
+	 */
+
 	pr_devinf("%s: got %u packets of %u total len\n", __func__,
 		  (uint)list.qlen, (uint)osize);
 	pr_devinf("%s: time delta %llu\n", __func__,
 		  (unsigned long long)(ktime_get_raw_fast_ns() - settime));
 
-	spin_lock(&xtfs->iptfs_lock);
 	__xfrm_iptfs_output_queued(x, &list);
-	spin_unlock(&xtfs->iptfs_lock);
 
 	return HRTIMER_NORESTART;
 }
