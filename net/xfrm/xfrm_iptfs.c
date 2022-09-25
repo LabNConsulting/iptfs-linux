@@ -22,10 +22,10 @@
 
 /* #define IPTFS_ENET_OHEAD (14 + 4 + 8 + 12) */
 /* #define GE_PPS(ge, iptfs_ip_mtu) ((1e8 * 10 ^ (ge - 1) / 8) / (iptfs_ip_mtu)) */
-#define XFRM_IPTFS_DELAY_NSECS (20 * NSECS_IN_USECS)
+#define XFRM_IPTFS_DELAY_NSECS (0 * NSECS_IN_USECS)
 
 /* maximum depth of queue for aggregating */
-#define XFRM_IPTFS_MAX_QUEUE_SIZE (1500 * 129)
+#define XFRM_IPTFS_MAX_QUEUE_SIZE (1024 * 1024)
 
 #undef PR_DEBUG_INFO
 #ifdef PR_DEBUG_INFO
@@ -33,6 +33,9 @@
 #else
 #define pr_devinf(...) pr_devel(__VA_ARGS__)
 #endif
+
+#define IPTFS_HRTIMER_MODE HRTIMER_MODE_REL_SOFT
+
 
 struct xfrm_iptfs_data {
 	struct xfrm_state *x; /* owning state */
@@ -48,10 +51,23 @@ static enum hrtimer_restart xfrm_iptfs_delay_timer(struct hrtimer *me);
 /* Utility Functions */
 /* ----------------- */
 
-uint icmpseq(struct sk_buff *skb)
+static inline uint _proto(struct sk_buff *skb)
 {
-	return ntohs(((struct icmphdr *)((struct iphdr *)skb->data + 1))
-			     ->un.echo.sequence);
+	return ((struct iphdr *)skb->data)->protocol;
+}
+
+static inline uint _seq(struct sk_buff *skb)
+{
+	uint protocol = _proto(skb);
+
+	if (protocol == IPPROTO_ICMP)
+		return ntohs(((struct icmphdr *)((struct iphdr *)skb->data + 1))
+				     ->un.echo.sequence);
+	else if (protocol == IPPROTO_TCP)
+		return ntohl(
+			((struct tcphdr *)((struct iphdr *)skb->data + 1))->seq);
+	else
+		return 0;
 }
 
 void xfrm_iptfs_get_rtt_and_delays(struct ip_iptfs_cc_hdr *cch, u32 *rtt,
@@ -88,7 +104,7 @@ int xfrm_iptfs_init_state(struct xfrm_state *x)
 	xtfs->x = x;
 	__skb_queue_head_init(&xtfs->delay_queue);
 	hrtimer_init(&xtfs->iptfs_timer, CLOCK_MONOTONIC,
-		     HRTIMER_MODE_REL_SOFT);
+		     IPTFS_HRTIMER_MODE);
 	xtfs->iptfs_timer.function = xfrm_iptfs_delay_timer;
 
 	return 0;
@@ -385,8 +401,8 @@ int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 				       first_skb->mac_len);
 			}
 		}
-		pr_devinf("%s: skb %p icmpseq %u\n", __func__, skb,
-			  icmpseq(skb));
+		pr_devinf("%s: skb %p proto %u seq %u\n", __func__, skb,
+			  _proto(skb), _seq(skb));
 
 		skb_reset_network_header(skb);
 		skb_set_transport_header(skb, iphlen);
@@ -459,8 +475,9 @@ int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 	/* Send the packets! */
 	list_for_each_entry_safe (skb, next, &sublist, list) {
 		skb_list_del_init(skb);
-		pr_devinf("%s: sending inner packet len %u skb %p icmpseq %u\n",
-			  __func__, (uint)skb->len, skb, icmpseq(skb));
+		pr_devinf(
+			"%s: sending inner packet len %u skb %p proto %u seq %u\n",
+			__func__, (uint)skb->len, skb, _proto(skb), _seq(skb));
 		gro_cells_receive(gro_cells, skb);
 	}
 
@@ -509,6 +526,9 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 	struct dst_entry *dst = skb_dst(skb);
 	struct xfrm_state *x = dst->xfrm;
 	struct xfrm_iptfs_data *xtfs = x->tfs_data;
+	struct sk_buff *segs, *nskb;
+	uint count, qcount;
+	bool ok = true;
 
 	/*
 	 * We have hooked into dst_entry->output which means we have skipped the
@@ -532,31 +552,82 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 	/* This will be set if we do a local ping! */
 	// WARN_ON(sk != NULL);
 
+	/*
+	 * Break apart GSO skbs. If the queue is nearing full then we want the
+	 * accounting and queuing to be based on the individual packets not on the
+	 * aggregate GSO buffer.
+	 */
+	if (!skb_is_gso(skb)) {
+		segs = skb;
+		BUG_ON(skb->next);
+	} else {
+		netdev_features_t features = netif_skb_features(skb);
+
+		pr_info_once("%s: received GSO skb (only printing once)\n", __func__);
+		pr_devinf("%s: splitting up gso skb %p", __func__, skb);
+
+		segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
+		if (IS_ERR_OR_NULL(segs)) {
+			/* XXX better stat here. */
+			XFRM_INC_STATS(net, LINUX_MIB_XFRMINERROR);
+			kfree_skb(skb);
+			return PTR_ERR(segs);
+		}
+		consume_skb(skb);
+	}
+
+	count = qcount = 0;
+
 	/* We can be running on multiple cores or from user context */
 	spin_lock_bh(&x->lock);
 
-	if (!__xfrm_itpfs_enqueue(xtfs, skb)) {
-		kfree_skb(skb);
-		BUG_ON(xtfs->delay_queue_size &&
-		       !hrtimer_is_queued(&xtfs->iptfs_timer));
-		goto out;
+	skb_list_walk_safe (segs, segs, nskb) {
+		skb = segs;
+		skb_mark_not_on_list(segs);
+		count++;
+
+		if (!ok) {
+			pr_devinf(
+				"%s: no space drop rest: skb: %p len %u data_len %u proto %u seq %u\n",
+				__func__, skb, (uint)skb->len, skb->data_len,
+				_proto(skb), _seq(skb));
+			kfree_skb(skb);
+			continue;
+		}
+
+		if (!(ok = __xfrm_itpfs_enqueue(xtfs, skb))) {
+			kfree_skb(skb);
+			continue;
+		}
+		qcount++;
+
+		// if (skb->protocol == htons(ETH_P_IPV6))
+		// mtu = ip6_skb_dst_mtu(skb);
+		pr_devinf(
+			"%s: skb: %p len %u data_len %u proto %u seq %u dst_mtu() => %d\n",
+			__func__, skb, (uint)skb->len, skb->data_len,
+			_proto(skb), _seq(skb), (int)dst_mtu(dst));
 	}
 
-	// if (skb->protocol == htons(ETH_P_IPV6))
-	// mtu = ip6_skb_dst_mtu(skb);
-	pr_devinf("%s: skb: %p len %u icmpseq %u dst_mtu() => %d\n", __func__,
-		  skb, (uint)skb->len, icmpseq(skb), (int)dst_mtu(dst));
+	if (count)
+		pr_devinf("%s: unpacked %u and queued %u from GSO skb\n",
+			  __func__, count, qcount);
+
+	if (!ok) {
+		/* Sanity check, if queue was full time should be set */
+		BUG_ON(xtfs->delay_queue_size &&
+		       !hrtimer_is_queued(&xtfs->iptfs_timer));
+	}
 
 	/* Start a delay timer if we don't have one yet */
 	if (!hrtimer_is_queued(&xtfs->iptfs_timer)) {
 		pr_devinf("%s: starting hrtimer\n", __func__);
 		/* softirq blocked lest the timer fire and interrupt us */
 		BUG_ON(!in_interrupt());
-		// HRTIMER_MODE_REL_PINNED_HARD?
 		hrtimer_start(&xtfs->iptfs_timer, XFRM_IPTFS_DELAY_NSECS,
-			      HRTIMER_MODE_REL_SOFT);
+			      IPTFS_HRTIMER_MODE);
 	}
-out:
+
 	xtfs->iptfs_settime = ktime_get_raw_fast_ns();
 	spin_unlock_bh(&x->lock);
 	return 0;
@@ -586,12 +657,11 @@ static int xfrm_iptfs_first_skb(struct sk_buff *skb)
 	h = skb_push(skb, hsz);
 	memset(h, 0, hsz);
 
-	if (1) { /* actually if IPTFS DF is set */
-		/* XXX verify skb->network_header points at skb->data? */
-		if ((!skb_is_gso(skb) && skb->len > mtu) ||
-		    (skb_is_gso(skb) &&
-		     !skb_gso_validate_network_len(skb, ip_skb_dst_mtu(skb->sk,
-								       skb)))) {
+	/* actually if IPTFS DF is set */
+	if (1) {
+		/* We've split these up before queuing */
+		BUG_ON(skb_is_gso(skb));
+		if (skb->len > mtu) {
 			/* pop the iptfs header back off */
 			skb_pull(skb, hsz);
 			icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
@@ -692,12 +762,15 @@ static void __xfrm_iptfs_output_queued(struct xfrm_state *x,
 	int err;
 
 	/* and send them on their way */
+
 	while ((skb = __skb_dequeue(list))) {
 		/* XXX we want this from the tunnel outer encap */
 		int remaining = dst_mtu(skb_dst(skb));
 
-		pr_devinf("%s: 1st dequeue skb %p len %u icmpseq: %u\n",
-			  __func__, skb, skb->len, icmpseq(skb));
+		pr_devinf(
+			"%s: 1st dequeue skb %p len %u data_len %u proto %u seq %u\n",
+			__func__, skb, skb->len, skb->data_len, _proto(skb),
+			_seq(skb));
 		if (xfrm_iptfs_first_skb(skb))
 			continue;
 
@@ -712,9 +785,9 @@ static void __xfrm_iptfs_output_queued(struct xfrm_state *x,
 			skb2 = __skb_dequeue(list);
 
 			pr_devinf(
-				"%s: appendg secondary dequeue skb2 %p len %u data_len %u icmpseq %u\n",
+				"%s: appendg secondary dequeue skb2 %p len %u data_len %u proto %u seq %u\n",
 				__func__, skb2, skb2->len, skb2->data_len,
-				icmpseq(skb2));
+				_proto(skb2), _seq(skb2));
 			// skb_shinfo(skb)->frag_list = skb2;
 			*nextp = skb2;
 			nextp = &skb2->next;
