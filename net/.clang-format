@@ -476,6 +476,7 @@ ForEachMacros:
   - 'sk_nulls_for_each_from'
   - 'sk_nulls_for_each_rcu'
   - 'skb_walk_frags'
+  - 'skb_list_walk_safe'
   - 'snd_array_for_each'
   - 'snd_pcm_group_for_each_entry'
   - 'snd_soc_dapm_widget_for_each_path'
