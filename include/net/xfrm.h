@@ -2192,9 +2192,14 @@ static inline int register_xfrm_interface_bpf(void)
 #endif
 
 #if IS_ENABLED(CONFIG_XFRM_IPTFS)
+#define XFRM_IPTFS_DEFAULT_MAX_QUEUE_SIZE (1024 * 1024)
+#define XFRM_IPTFS_DEFAULT_INIT_DELAY_USECS (0)
+#define XFRM_IPTFS_DEFAULT_DROP_TIME_USECS (1000000)
+#define XFRM_IPTFS_DEFAULT_REORDER_WINDOW (3)
+
 int xfrm_iptfs_copy_to_user_state(struct xfrm_state *x, struct sk_buff *skb);
 
-int xfrm_iptfs_user_init(struct xfrm_state *x, struct nlattr **attrs);
+int xfrm_iptfs_user_init(struct net *net, struct xfrm_state *x, struct nlattr **attrs);
 int xfrm_iptfs_init_state(struct xfrm_state *x);
 int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 		     struct sk_buff *skb);

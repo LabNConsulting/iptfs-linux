@@ -23,19 +23,6 @@
 /* #define IPTFS_ENET_OHEAD (14 + 4 + 8 + 12) */
 /* #define GE_PPS(ge, iptfs_ip_mtu) ((1e8 * 10 ^ (ge - 1) / 8) / (iptfs_ip_mtu)) */
 
-/* XXX turn this into a sysctl */
-#define XFRM_IPTFS_DEFAULT_DELAY_USECS (0)
-
-/* XXX turn this into a sysctl */
-#define XFRM_IPTFS_DEFAULT_DROP_TIME_USECS (1000 * USECS_IN_MSEC)
-
-/* XXX turn this into a sysctl */
-#define XFRM_IPTFS_DEFAULT_REORDER_WINDOW (3)
-
-/* XXX turn this into a sysctl */
-/* default maximum depth of queue for aggregating */
-#define XFRM_IPTFS_DEFAULT_MAX_QUEUE_SIZE (1024 * 1024)
-
 #undef PR_DEBUG_INFO
 #ifdef PR_DEBUG_INFO
 #define pr_devinf(...) pr_info(__VA_ARGS__)
@@ -125,7 +112,7 @@ int xfrm_iptfs_init_state(struct xfrm_state *x)
 	xtfs->x = x;
 	xtfs->cfg.reorder_win_size = XFRM_IPTFS_DEFAULT_REORDER_WINDOW;
 	xtfs->cfg.max_queue_size = XFRM_IPTFS_DEFAULT_MAX_QUEUE_SIZE;
-	xtfs->cfg.init_delay_us = XFRM_IPTFS_DEFAULT_DELAY_USECS;
+	xtfs->cfg.init_delay_us = XFRM_IPTFS_DEFAULT_INIT_DELAY_USECS;
 	xtfs->cfg.drop_time_us = XFRM_IPTFS_DEFAULT_DROP_TIME_USECS;
 
 	__skb_queue_head_init(&xtfs->queue);
@@ -153,7 +140,7 @@ void xfrm_iptfs_state_destroy(struct xfrm_state *x)
 	kfree_sensitive(xtfs);
 }
 
-int xfrm_iptfs_user_init(struct xfrm_state *x, struct nlattr **attrs)
+int xfrm_iptfs_user_init(struct net *net, struct xfrm_state *x, struct nlattr **attrs)
 {
 	struct xfrm_iptfs_data *xtfs = x->tfs_data;
 	struct xfrm_iptfs_config *xc;
@@ -162,6 +149,11 @@ int xfrm_iptfs_user_init(struct xfrm_state *x, struct nlattr **attrs)
 		return EINVAL;
 
 	xc = &xtfs->cfg;
+	xc->reorder_win_size = net->xfrm.sysctl_iptfs_rewin;
+	xc->max_queue_size = net->xfrm.sysctl_iptfs_maxqsize;
+	xc->init_delay_us = net->xfrm.sysctl_iptfs_idelay;
+	xc->drop_time_us = net->xfrm.sysctl_iptfs_drptime;
+
 	if (attrs[XFRMA_IPTFS_DONT_FRAG])
 		xc->dont_frag = true;
 	if (attrs[XFRMA_IPTFS_REORD_WIN])
