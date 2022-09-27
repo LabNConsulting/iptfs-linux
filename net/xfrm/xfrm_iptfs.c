@@ -49,7 +49,7 @@ struct xfrm_iptfs_config {
 	bool dont_frag : 1;
 	u16 reorder_win_size;
 	u32 pkt_size;		/* outer_packet_size or 0 */
-	u32 max_delay_qsize;	/* octets */
+	u32 max_queue_size;	/* octets */
 	u64 init_delay_us;	/* microseconds */
 	u32 drop_time_us;	/* microseconds */
 };
@@ -57,8 +57,8 @@ struct xfrm_iptfs_config {
 struct xfrm_iptfs_data {
 	struct xfrm_iptfs_config cfg;
 	struct xfrm_state *x;		/* owning state */
-	struct sk_buff_head delay_queue;
-	u32 delay_queue_size;		/* octets */
+	struct sk_buff_head queue;
+	u32 queue_size;		/* octets */
 	u64 init_delay_ns;		/* nanoseconds */
 	struct hrtimer iptfs_timer;
 	time64_t iptfs_settime;
@@ -124,11 +124,11 @@ int xfrm_iptfs_init_state(struct xfrm_state *x)
 
 	xtfs->x = x;
 	xtfs->cfg.reorder_win_size = XFRM_IPTFS_DEFAULT_REORDER_WINDOW;
-	xtfs->cfg.max_delay_qsize = XFRM_IPTFS_DEFAULT_MAX_QUEUE_SIZE;
+	xtfs->cfg.max_queue_size = XFRM_IPTFS_DEFAULT_MAX_QUEUE_SIZE;
 	xtfs->cfg.init_delay_us = XFRM_IPTFS_DEFAULT_DELAY_USECS;
 	xtfs->cfg.drop_time_us = XFRM_IPTFS_DEFAULT_DROP_TIME_USECS;
 
-	__skb_queue_head_init(&xtfs->delay_queue);
+	__skb_queue_head_init(&xtfs->queue);
 	xtfs->init_delay_ns = xtfs->cfg.init_delay_us * NSECS_IN_USEC;
 	hrtimer_init(&xtfs->iptfs_timer, CLOCK_MONOTONIC,
 		     IPTFS_HRTIMER_MODE);
@@ -169,7 +169,7 @@ int xfrm_iptfs_user_init(struct xfrm_state *x, struct nlattr **attrs)
 	if (attrs[XFRMA_IPTFS_PKT_SIZE])
 		xc->pkt_size = nla_get_u32(attrs[XFRMA_IPTFS_PKT_SIZE]);
 	if (attrs[XFRMA_IPTFS_MAX_QSIZE])
-		xc->max_delay_qsize = nla_get_u32(attrs[XFRMA_IPTFS_MAX_QSIZE]);
+		xc->max_queue_size = nla_get_u32(attrs[XFRMA_IPTFS_MAX_QSIZE]);
 	if (attrs[XFRMA_IPTFS_DROP_TIME]) {
 		xc->drop_time_us = nla_get_u32(attrs[XFRMA_IPTFS_DROP_TIME]);
 		xtfs->drop_time_ns = xc->drop_time_us * NSECS_IN_USEC;
@@ -195,7 +195,7 @@ int xfrm_iptfs_copy_to_user_state(struct xfrm_state *x, struct sk_buff *skb)
 		return ret;
 	if ((ret = nla_put_u32(skb, XFRMA_IPTFS_PKT_SIZE, xc->pkt_size)))
 		return ret;
-	if ((ret = nla_put_u32(skb, XFRMA_IPTFS_MAX_QSIZE, xc->max_delay_qsize)))
+	if ((ret = nla_put_u32(skb, XFRMA_IPTFS_MAX_QSIZE, xc->max_queue_size)))
 		return ret;
 	if ((ret = nla_put_u32(skb, XFRMA_IPTFS_DROP_TIME, xc->drop_time_us)))
 		return ret;
@@ -588,15 +588,15 @@ static bool __xfrm_itpfs_enqueue(struct xfrm_iptfs_data *xtfs,
 	assert_spin_locked(&xtfs->x->lock);
 
 	/* For now we use a predefined constant value, eventually configuration */
-	if (xtfs->delay_queue_size + skb->len > xtfs->cfg.max_delay_qsize) {
+	if (xtfs->queue_size + skb->len > xtfs->cfg.max_queue_size) {
 		pr_warn_ratelimited(
 			"%s: no space: qsize: %u skb len %u max %u\n", __func__,
-			xtfs->delay_queue_size, (uint)skb->len,
-			xtfs->cfg.max_delay_qsize);
+			xtfs->queue_size, (uint)skb->len,
+			xtfs->cfg.max_queue_size);
 		return false;
 	}
-	__skb_queue_tail(&xtfs->delay_queue, skb);
-	xtfs->delay_queue_size += skb->len;
+	__skb_queue_tail(&xtfs->queue, skb);
+	xtfs->queue_size += skb->len;
 	return true;
 }
 
@@ -699,7 +699,7 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 
 	if (!ok) {
 		/* Sanity check, if queue was full time should be set */
-		BUG_ON(xtfs->delay_queue_size &&
+		BUG_ON(xtfs->queue_size &&
 		       !hrtimer_is_queued(&xtfs->iptfs_timer));
 	}
 
@@ -938,9 +938,9 @@ static enum hrtimer_restart xfrm_iptfs_delay_timer(struct hrtimer *me)
 
 	spin_lock(&x->lock);
 	__skb_queue_head_init(&list);
-	skb_queue_splice_init(&xtfs->delay_queue, &list);
-	osize = xtfs->delay_queue_size;
-	xtfs->delay_queue_size = 0;
+	skb_queue_splice_init(&xtfs->queue, &list);
+	osize = xtfs->queue_size;
+	xtfs->queue_size = 0;
 	settime = xtfs->iptfs_settime;
 	spin_unlock(&x->lock);
 
