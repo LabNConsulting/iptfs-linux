@@ -221,6 +221,14 @@ static int verify_newsa_info(struct xfrm_usersa_info *p,
 		if (attrs[XFRMA_TFCPAD] &&
 		    p->mode != XFRM_MODE_TUNNEL)
 			goto out;
+		if ((attrs[XFRMA_IPTFS_PKT_SIZE] ||
+		     attrs[XFRMA_IPTFS_MAX_QSIZE] ||
+		     attrs[XFRMA_IPTFS_DONT_FRAG] ||
+		     attrs[XFRMA_IPTFS_DROP_TIME] ||
+		     attrs[XFRMA_IPTFS_REORD_WIN] ||
+		     attrs[XFRMA_IPTFS_IN_DELAY]) &&
+		    p->mode != XFRM_MODE_IPTFS)
+			goto out;
 		break;
 
 	case IPPROTO_COMP:
@@ -668,6 +676,12 @@ static struct xfrm_state *xfrm_state_construct(struct net *net,
 			goto error;
 	}
 
+#if IS_ENABLED(CONFIG_XFRM_IPTFS)
+	if (x->props.mode == XFRM_MODE_IPTFS)
+		err = xfrm_iptfs_user_init(x, attrs);
+	if (err)
+		goto error;
+#endif
 	return x;
 
 error:
@@ -1040,6 +1054,12 @@ static int copy_to_user_state_extra(struct xfrm_state *x,
 		if (ret)
 			goto out;
 	}
+#if IS_ENABLED(CONFIG_XFRM_IPTFS)
+	if (x->props.mode == XFRM_MODE_IPTFS)
+		ret = xfrm_iptfs_copy_to_user_state(x, skb);
+	if (ret)
+		goto out;
+#endif
 	if (x->mapping_maxage)
 		ret = nla_put_u32(skb, XFRMA_MTIMER_THRESH, x->mapping_maxage);
 out:
@@ -2812,6 +2832,12 @@ const struct nla_policy xfrma_policy[XFRMA_MAX+1] = {
 	[XFRMA_SET_MARK]	= { .type = NLA_U32 },
 	[XFRMA_SET_MARK_MASK]	= { .type = NLA_U32 },
 	[XFRMA_IF_ID]		= { .type = NLA_U32 },
+	[XFRMA_IPTFS_PKT_SIZE]	= { .type = NLA_U32 },
+	[XFRMA_IPTFS_MAX_QSIZE]	= { .type = NLA_U32 },
+	[XFRMA_IPTFS_DONT_FRAG]	= { .type = NLA_FLAG },
+	[XFRMA_IPTFS_DROP_TIME]	= { .type = NLA_U32 },
+	[XFRMA_IPTFS_REORD_WIN]	= { .type = NLA_U16 },
+	[XFRMA_IPTFS_IN_DELAY]	= { .type = NLA_U32 },
 };
 EXPORT_SYMBOL_GPL(xfrma_policy);
 
