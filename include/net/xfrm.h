@@ -2192,6 +2192,9 @@ static inline int register_xfrm_interface_bpf(void)
 #endif
 
 #if IS_ENABLED(CONFIG_XFRM_IPTFS)
+int xfrm_iptfs_copy_to_user_state(struct xfrm_state *x, struct sk_buff *skb);
+
+int xfrm_iptfs_user_init(struct xfrm_state *x, struct nlattr **attrs);
 int xfrm_iptfs_init_state(struct xfrm_state *x);
 int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 		     struct sk_buff *skb);
