@@ -26,6 +26,8 @@
 /* #define IPTFS_ENET_OHEAD (14 + 4 + 8 + 12) */
 /* #define GE_PPS(ge, iptfs_ip_mtu) ((1e8 * 10 ^ (ge - 1) / 8) / (iptfs_ip_mtu)) */
 
+// XXX use consume_skb for freeing when no errorr.
+
 #define PR_DEBUG_INFO
 #ifdef PR_DEBUG_INFO
 #define pr_devinf(...) pr_info(__VA_ARGS__)
@@ -121,6 +123,9 @@ void xfrm_iptfs_get_rtt_and_delays(struct ip_iptfs_cc_hdr *cch, u32 *rtt,
 /* -------------------------- */
 /* State Management Functions */
 /* -------------------------- */
+
+#undef pr_fmt
+#define pr_fmt(fmt) "%s: STATE: " fmt, __func__
 
 int xfrm_iptfs_init_state(struct xfrm_state *x)
 {
@@ -220,6 +225,9 @@ int xfrm_iptfs_copy_to_user_state(struct xfrm_state *x, struct sk_buff *skb)
 /* IPTFS Receiving (egress) Functions */
 /* ---------------------------------- */
 
+#undef pr_fmt
+#define pr_fmt(fmt) "%s: EGRESS: " fmt, __func__
+
 struct sk_buff *skb_at_offset(struct sk_buff *skb, uint offset, uint len)
 {
 	if (offset >= skb->len)
@@ -291,7 +299,7 @@ static struct sk_buff *iptfs_alloc_skb(struct sk_buff *tpl, uint len)
 	if (resv < XFRM_IPTFS_MIN_HEADROOM)
 		resv = XFRM_IPTFS_MIN_HEADROOM;
 
-	pr_devinf("%s: len %u resv %u\n", __func__, len, resv);
+	pr_devinf("len %u resv %u\n", len, resv);
 	skb = alloc_skb(len + resv, GFP_ATOMIC);
 	if (!skb)
 		return NULL;
@@ -347,7 +355,7 @@ static inline void iptfs_input_save_runt(struct xfrm_iptfs_data *xtfs, u64 seq,
 {
 	BUG_ON(xtfs->ra_newskb); /* we won't have a new SKB yet */
 
-	pr_devinf("%s: saving runt len %u, exp seq %llu\n", __func__, len, seq);
+	pr_devinf("saving runt len %u, exp seq %llu\n", len, seq);
 	memcpy(xtfs->ra_runt, buf, len);
 
 	xtfs->ra_runtlen = len;
@@ -396,8 +404,8 @@ static int iptfs_complete_inner_skb(struct xfrm_state *x, struct sk_buff *skb,
 	 */
 	iph = ip_hdr(skb);
 
-	pr_devinf("%s: completing inner, iplen %u skb len %u iphlen %u\n",
-		  __func__, ntohs(iph->tot_len), skb->len, iphlen);
+	pr_devinf("completing inner, iplen %u skb len %u iphlen %u\n",
+		  ntohs(iph->tot_len), skb->len, iphlen);
 
 	if (iph->version == 0x4) {
 		if (x->props.flags & XFRM_STATE_DECAP_DSCP)
@@ -449,9 +457,9 @@ static enum hrtimer_restart iptfs_drop_timer(struct hrtimer *me)
 	spin_lock(&xtfs->drop_lock);
 
 	if (!xtfs->ra_newskb) {
-		pr_devinf("%s: drop timer -- but no reassembly\n", __func__);
+		pr_devinf("drop timer -- but no reassembly\n");
 	} else {
-		pr_devinf("%s: drop timer -- dropping reassemble\n", __func__);
+		pr_devinf("drop timer -- dropping reassemble\n");
 		kfree_skb(xtfs->ra_newskb);
 		xtfs->ra_newskb = NULL;
 	}
@@ -468,7 +476,7 @@ static inline void _iptfs_reassem_done(struct xfrm_iptfs_data *xtfs, bool free)
 
 	/* We don't care if it works locking takes care of things */
 	ret = hrtimer_try_to_cancel(&xtfs->drop_timer);
-	pr_devinf("%s: canceled drop timer ret: %d\n", __func__, ret);
+	pr_devinf("canceled drop timer ret: %d\n", ret);
 	if (free)
 		kfree_skb(xtfs->ra_newskb);
 	xtfs->ra_newskb = NULL;
@@ -503,7 +511,7 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 		 * We are reassembling but this is an old sequence number.
 		 */
 		XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_OLD_SEQ);
-		pr_devinf("%s: older seq %llu expecting %llu\n", __func__, seq,
+		pr_devinf("older seq %llu expecting %llu\n", seq,
 			  xtfs->ra_nseq);
 		/* will end parsing */
 		return data + remaining;
@@ -515,7 +523,7 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 	 */
 	if (xtfs->ra_nseq == seq && blkoff == 0 && (*skb->data & 0xF0) == 0) {
 		XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_ALL_PAD_SKIP);
-		pr_devinf("%s: skipping all pad seq %llu \n", __func__, seq);
+		pr_devinf("skipping all pad seq %llu \n", seq);
 		xtfs->ra_nseq++;
 		/* will end parsing */
 		return data + remaining;
@@ -528,7 +536,7 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 		 * have allocated a skb yet.
 		 */
 		BUG_ON(xtfs->ra_newskb);
-		pr_devinf("%s: have runt data len %u\n", __func__, rlen);
+		pr_devinf("have runt data len %u\n", rlen);
 		/*
 		 * The start of this inner packet was at the very end of the last
 		 * iptfs payload which didn't include enough for the ip header
@@ -539,8 +547,8 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 			XFRM_INC_STATS(dev_net(skb->dev),
 				       LINUX_MIB_XFRMINBUFFERERROR);
 			pr_err_ratelimited(
-				"%s: bad recv after runt: blkoff/remain %u/%u < runtrem %u\n",
-				__func__, blkoff, remaining, rrem);
+				"bad recv after runt: blkoff/remain %u/%u < runtrem %u\n",
+				blkoff, remaining, rrem);
 			/* will continue on to new data block or end */
 			return data + min(blkoff, remaining);
 		}
@@ -555,7 +563,7 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 		if (!newskb) {
 			XFRM_INC_STATS(dev_net(skb->dev),
 				       LINUX_MIB_XFRMINERROR);
-			pr_err_ratelimited("%s: can't get new skb", __func__);
+			pr_err_ratelimited("can't get new skb");
 			return data + min(blkoff, remaining);
 		}
 		xtfs->ra_newskb = newskb;
@@ -578,25 +586,24 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 		XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_MISSED_FRAG_START);
 		if (!newskb) {
 			pr_devinf(
-				"%s: block offset: %u (or runt %u) but not reassembling\n",
-				__func__, blkoff, rlen);
+				"block offset: %u (or runt %u) but not reassembling\n",
+				blkoff, rlen);
 		} else {
 			pr_devinf(
-				"%s: missed frag seq, want: %llu got: %llu, skipping over frag %u\n",
-				__func__, xtfs->ra_nseq, seq, blkoff);
+				"missed frag seq, want: %llu got: %llu, skipping over frag %u\n",
+				xtfs->ra_nseq, seq, blkoff);
 			/* drop unfinished packet reassembly */
 			iptfs_reassem_abort(xtfs);
 		}
 		if (blkoff >= remaining) {
-			pr_devinf("%s: skipping entire fragment payload\n",
-				  __func__);
+			pr_devinf("skipping entire fragment payload\n");
 			/* will end parsing */
 			return data + remaining;
 		}
 
 		/* will continue on to new data block */
-		pr_devinf("%s: skipping to next fragment blkoff/remain %u/%u\n",
-			  __func__, blkoff, remaining);
+		pr_devinf("skipping to next fragment blkoff/remain %u/%u\n",
+			  blkoff, remaining);
 		return data + blkoff;
 	}
 
@@ -608,8 +615,8 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 		/* Corrupt data, we don't have enough to complete the packet */
 		XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_IPLEN_BAD_BLOCKOFF);
 		pr_err_ratelimited(
-			"%s: bad recv blkoff: blkoff %u < ip remaining %u\n",
-			__func__, blkoff, ipremain);
+			"bad recv blkoff: blkoff %u < ip remaining %u\n",
+			blkoff, ipremain);
 		iptfs_reassem_abort(xtfs);
 		/* will end parsing */
 		return data + remaining;
@@ -620,12 +627,12 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 	BUG_ON(skb_tailroom(newskb) < copylen);
 
 	pr_devinf(
-		"%s: continue to reassem, ipremain %u blkoff %u remain %u fraglen %u copylen %u\n",
-		__func__, ipremain, blkoff, remaining, fraglen, copylen);
+		"continue to reassem, ipremain %u blkoff %u remain %u fraglen %u copylen %u\n",
+		ipremain, blkoff, remaining, fraglen, copylen);
 
 	/* copy fragment data into newskb */
 	if (skb_copy_bits_seq(st, data, skb_put(newskb, copylen), copylen)) {
-		pr_err_ratelimited("%s: bad skb\n", __func__);
+		pr_err_ratelimited("bad skb\n");
 		XFRM_INC_STATS(dev_net(skb->dev), LINUX_MIB_XFRMINBUFFERERROR);
 		iptfs_reassem_abort(xtfs);
 		/* will end parsing */
@@ -634,13 +641,13 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 
 	if (copylen < ipremain) {
 		xtfs->ra_nseq++;
-		pr_devinf("%s: packet unfinished, inc exp seq to %llu\n",
-			  __func__, xtfs->ra_nseq);
+		pr_devinf("packet unfinished, inc exp seq to %llu\n",
+			  xtfs->ra_nseq);
 	} else {
 		/* We are done with packet reassembly! */
 		BUG_ON(copylen != ipremain);
 		iptfs_reassem_done(xtfs);
-		pr_devinf("%s: packet finished, %u left in payload\n", __func__,
+		pr_devinf("packet finished, %u left in payload\n",
 			  remaining - copylen);
 		if (iptfs_complete_inner_skb(xtfs->x, newskb,
 					     __iptfs_iphdrlen(newskb->data))) {
@@ -680,8 +687,7 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 	first_skb = NULL;
 	defer = NULL;
 
-	pr_devinf("%s: processing skb with len %u seq %llu\n", __func__,
-		  skb->len, seq);
+	pr_devinf("processing skb with len %u seq %llu\n", skb->len, seq);
 
 	/* large enough to hold both types of header */
 	ipth = (struct ip_iptfs_hdr *)&iptcch;
@@ -703,7 +709,7 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 
 	if (skb_copy_bits_seq(&skbseq, 0, ipth, sizeof(*ipth))) {
 	badskb:
-		pr_err_ratelimited("%s: bad skb\n", __func__);
+		pr_err_ratelimited("bad skb\n");
 		XFRM_INC_STATS(net, LINUX_MIB_XFRMINBUFFERERROR);
 		goto done;
 	}
@@ -718,7 +724,7 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 		data += remaining;
 	} else if (ipth->subtype != IPTFS_SUBTYPE_BASIC) {
 	badhdr:
-		pr_err_ratelimited("%s: bad iptfs hdr\n", __func__);
+		pr_err_ratelimited("bad iptfs hdr\n");
 		XFRM_INC_STATS(net, LINUX_MIB_XFRMINHDRERROR);
 		goto done;
 	}
@@ -778,8 +784,7 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 
 			iplen = htons(iph->tot_len);
 			iphlen = iph->ihl << 2;
-			pr_devinf("%s: ipv4 inner length %u\n", __func__,
-				  iplen);
+			pr_devinf("ipv4 inner length %u\n", iplen);
 		} else if (iph->version == 0x6) {
 			/* must have at least payload_len field present */
 			if (remaining < 6) {
@@ -794,17 +799,15 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 			/* XXX chopps: what about extra headers? ipv6_input
                          * seems to just do this */
 			iphlen = sizeof(struct ipv6hdr);
-			pr_devinf("%s: ipv6 inner length %u\n", __func__,
-				  iplen);
+			pr_devinf("ipv6 inner length %u\n", iplen);
 		} else if (iph->version == 0x0) {
 			/* pad */
-			pr_devinf("%s: padding length %u\n", __func__,
-				  remaining);
+			pr_devinf("padding length %u\n", remaining);
 			data = tail;
 			break;
 		} else {
-			pr_warn("%s: unknown inner datablock type %u\n",
-				__func__, iph->version);
+			pr_warn("unknown inner datablock type %u\n",
+				iph->version);
 			XFRM_INC_STATS(net, LINUX_MIB_XFRMINBUFFERERROR);
 			goto done;
 		}
@@ -880,8 +883,7 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 				skb_abort_seq_read(&skbseq);
 				skb_prepare_seq_read(skb, data, tail, &skbseq);
 
-				pr_devinf("%s: reusing outer skb %p\n",
-					  __func__, skb);
+				pr_devinf("reusing outer skb %p\n", skb);
 			} else {
 				/* first skb didn't have enough space */
 				defer = skb;
@@ -896,12 +898,11 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 			skb = iptfs_pskb_extract_seq(iplen, resv, &skbseq, data,
 						     capturelen);
 			if (!skb) {
-				pr_err("%s: failed to alloc new skb\n",
-				       __func__);
+				pr_err("failed to alloc new skb\n");
 				XFRM_INC_STATS(net, LINUX_MIB_XFRMINERROR);
 				continue;
 			}
-			pr_devinf("%s: alloc'd new skb %p\n", __func__, skb);
+			pr_devinf("alloc'd new skb %p\n", skb);
 
 			if (old_mac) {
 				/* rebuild the mac header */
@@ -911,8 +912,8 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 			}
 		}
 
-		pr_devinf("%s: new skb %p ip proto %u icmp/tcp seq %u\n",
-			  __func__, skb, _proto(skb), _seq(skb));
+		pr_devinf("new skb %p ip proto %u icmp/tcp seq %u\n", skb,
+			  _proto(skb), _seq(skb));
 
 		data += capturelen;
 
@@ -923,16 +924,15 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 			/*
 			 * Start reassembly
 			 */
-			pr_devinf("%s: payload done, save packet (%u of %u)\n",
-				  __func__, skb->len, iplen);
+			pr_devinf("payload done, save packet (%u of %u)\n",
+				  skb->len, iplen);
 
 			spin_lock(&xtfs->drop_lock);
 
 			xtfs->ra_newskb = skb;
 			xtfs->ra_nseq = seq + 1;
 			if (!hrtimer_is_queued(&xtfs->drop_timer)) {
-				pr_devinf("%s: starting drop timer\n",
-					  __func__);
+				pr_devinf("starting drop timer\n");
 				/* softirq blocked lest the timer fire and interrupt us */
 				BUG_ON(!in_interrupt());
 				hrtimer_start(&xtfs->drop_timer,
@@ -959,8 +959,7 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 
 	if (data != tail) {
 		/* error or pdding */
-		pr_devinf("%s: error data(%u) != tail(%u)\n", __func__, data,
-			  tail);
+		pr_devinf("error data(%u) != tail(%u)\n", data, tail);
 	}
 
 	if (first_skb && first_iplen && !defer) {
@@ -975,8 +974,8 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 	list_for_each_entry_safe (skb, next, &sublist, list) {
 		skb_list_del_init(skb);
 		pr_devinf(
-			"%s: sending inner packet len %u skb %p proto %u seq %u\n",
-			__func__, (uint)skb->len, skb, _proto(skb), _seq(skb));
+			"sending inner packet len %u skb %p proto %u seq %u\n",
+			(uint)skb->len, skb, _proto(skb), _seq(skb));
 		gro_cells_receive(gro_cells, skb);
 	}
 
@@ -1020,6 +1019,9 @@ int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 /* IPTFS Sending (ingress) Functions */
 /* --------------------------------- */
 
+#undef pr_fmt
+#define pr_fmt(fmt) "%s: INGRESS: " fmt, __func__
+
 /*
  * Check to see if it's OK to queue a packet for sending on tunnel.
  */
@@ -1029,10 +1031,9 @@ static bool iptfs_enqueue(struct xfrm_iptfs_data *xtfs, struct sk_buff *skb)
 
 	/* For now we use a predefined constant value, eventually configuration */
 	if (xtfs->queue_size + skb->len > xtfs->cfg.max_queue_size) {
-		pr_warn_ratelimited(
-			"%s: no space: qsize: %u skb len %u max %u\n", __func__,
-			xtfs->queue_size, (uint)skb->len,
-			xtfs->cfg.max_queue_size);
+		pr_warn_ratelimited("no space: qsize: %u skb len %u max %u\n",
+				    xtfs->queue_size, (uint)skb->len,
+				    xtfs->cfg.max_queue_size);
 		return false;
 	}
 	__skb_queue_tail(&xtfs->queue, skb);
@@ -1087,9 +1088,8 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 	} else {
 		netdev_features_t features = netif_skb_features(skb);
 
-		pr_info_once("%s: received GSO skb (only printing once)\n",
-			     __func__);
-		pr_devinf("%s: splitting up gso skb %p", __func__, skb);
+		pr_info_once("received GSO skb (only printing once)\n");
+		pr_devinf("splitting up gso skb %p", skb);
 
 		segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
 		if (IS_ERR_OR_NULL(segs)) {
@@ -1113,9 +1113,9 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 
 		if (!ok) {
 			pr_devinf(
-				"%s: no space drop rest: skb: %p len %u data_len %u proto %u seq %u\n",
-				__func__, skb, (uint)skb->len, skb->data_len,
-				_proto(skb), _seq(skb));
+				"no space drop rest: skb: %p len %u data_len %u proto %u seq %u\n",
+				skb, (uint)skb->len, skb->data_len, _proto(skb),
+				_seq(skb));
 			kfree_skb(skb);
 			continue;
 		}
@@ -1129,14 +1129,14 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 		// if (skb->protocol == htons(ETH_P_IPV6))
 		// mtu = ip6_skb_dst_mtu(skb);
 		pr_devinf(
-			"%s: skb: %p len %u data_len %u proto %u seq %u dst_mtu() => %d\n",
-			__func__, skb, (uint)skb->len, skb->data_len,
-			_proto(skb), _seq(skb), (int)dst_mtu(dst));
+			"skb: %p len %u data_len %u proto %u seq %u dst_mtu() => %d\n",
+			skb, (uint)skb->len, skb->data_len, _proto(skb),
+			_seq(skb), (int)dst_mtu(dst));
 	}
 
 	if (count)
-		pr_devinf("%s: unpacked %u and queued %u from GSO skb\n",
-			  __func__, count, qcount);
+		pr_devinf("unpacked %u and queued %u from GSO skb\n", count,
+			  qcount);
 
 	if (!ok) {
 		/* Sanity check, if queue was full time should be set */
@@ -1146,7 +1146,7 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 
 	/* Start a delay timer if we don't have one yet */
 	if (!hrtimer_is_queued(&xtfs->iptfs_timer)) {
-		pr_devinf("%s: starting hrtimer\n", __func__);
+		pr_devinf("starting hrtimer\n");
 		/* softirq blocked lest the timer fire and interrupt us */
 		BUG_ON(!in_interrupt());
 		hrtimer_start(&xtfs->iptfs_timer, xtfs->init_delay_ns,
@@ -1292,9 +1292,8 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 		int remaining = dst_mtu(skb_dst(skb));
 
 		pr_devinf(
-			"%s: 1st dequeue skb %p len %u data_len %u proto %u seq %u\n",
-			__func__, skb, skb->len, skb->data_len, _proto(skb),
-			_seq(skb));
+			"1st dequeue skb %p len %u data_len %u proto %u seq %u\n",
+			skb, skb->len, skb->data_len, _proto(skb), _seq(skb));
 		if (iptfs_first_skb(skb))
 			continue;
 
@@ -1309,9 +1308,9 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 			skb2 = __skb_dequeue(list);
 
 			pr_devinf(
-				"%s: appendg secondary dequeue skb2 %p len %u data_len %u proto %u seq %u\n",
-				__func__, skb2, skb2->len, skb2->data_len,
-				_proto(skb2), _seq(skb2));
+				"appendg secondary dequeue skb2 %p len %u data_len %u proto %u seq %u\n",
+				skb2, skb2->len, skb2->data_len, _proto(skb2),
+				_seq(skb2));
 			// skb_shinfo(skb)->frag_list = skb2;
 			*nextp = skb2;
 			nextp = &skb2->next;
@@ -1325,8 +1324,7 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
                          */
 			if (skb_has_frag_list(skb2)) {
 				pr_devinf(
-					"%s: 2nd skb2 has frag list collapsing\n",
-					__func__);
+					"2nd skb2 has frag list collapsing\n");
 				/*
                                  * I think it might be possible to account for
                                  * a frag list in addition to page fragment if
@@ -1346,9 +1344,8 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 			remaining -= skb2->len;
 		}
 
-		pr_devinf(
-			"%s: output skb %p, total len %u remaining space %u\n",
-			__func__, skb, skb->len, remaining);
+		pr_devinf("output skb %p, total len %u remaining space %u\n",
+			  skb, skb->len, remaining);
 		err = xfrm_output(NULL, skb);
 		if (err < 0) {
 			printk("XXX got xfrm_output error: %d", err);
@@ -1396,9 +1393,9 @@ static enum hrtimer_restart iptfs_delay_timer(struct hrtimer *me)
 	 * spewing packets out of order.
 	 */
 
-	pr_devinf("%s: got %u packets of %u total len\n", __func__,
-		  (uint)list.qlen, (uint)osize);
-	pr_devinf("%s: time delta %llu\n", __func__,
+	pr_devinf("got %u packets of %u total len\n", (uint)list.qlen,
+		  (uint)osize);
+	pr_devinf("time delta %llu\n",
 		  (unsigned long long)(ktime_get_raw_fast_ns() - settime));
 
 	iptfs_output_queued(x, &list);
