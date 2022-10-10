@@ -845,7 +845,7 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 				/* if first skb has frags copy packet data into new skb */
 				defer = skb;
 				skb = NULL;
-			} else if (skb_end_offset(skb) - data >= iplen) {
+			} else if (skb_tailroom(skb) + tail - data >= iplen) {
 				/*
 				 * Reuse fist skb. Need to move past the initial
 				 * iptfs header as well as any initial fragment
