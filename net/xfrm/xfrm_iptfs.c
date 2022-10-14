@@ -26,9 +26,7 @@
 /* #define IPTFS_ENET_OHEAD (14 + 4 + 8 + 12) */
 /* #define GE_PPS(ge, iptfs_ip_mtu) ((1e8 * 10 ^ (ge - 1) / 8) / (iptfs_ip_mtu)) */
 
-// XXX use consume_skb for freeing when no errorr.
-
-#define PR_DEBUG_INFO
+#undef PR_DEBUG_INFO
 #ifdef PR_DEBUG_INFO
 #define pr_devinf(...) pr_info(__VA_ARGS__)
 #else
@@ -984,7 +982,7 @@ done:
 	skb_abort_seq_read(&skbseq);
 
 	if (defer)
-		kfree_skb(defer);
+		consume_skb(defer);
 
 	return 0;
 }
@@ -1158,42 +1156,51 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 	return 0;
 }
 
-static int iptfs_first_skb(struct sk_buff *skb)
+static int iptfs_first_skb(struct sk_buff *skb, bool df)
 {
 	struct ip_iptfs_hdr *h;
 	size_t hsz = sizeof(*h);
 	int mtu = dst_mtu(skb_dst(skb));
 
-	/* (x->outer_mode.encap == IPTFS */
-	// if (x->outer_mode.family == AF_INET)
-	// else if (x->outer_mode.family == AF_INET6)
-	// return -EOPNOTSUPP;
+	/*
+	 * Classic ESP skips the don't fragment ICMP error if DF is clear on
+	 * the inner packet or ignore_df is set. Otherwise it will send an ICMP
+	 * or local error if the inner packet won't fit it's MTU.
+	 *
+	 * With IPTFS we do not care about the inner packet DF bit. If the
+	 * tunnel is configured to "don't fragment" we error back if things
+	 * don't fit in our max packet size. Otherwise we iptfs-fragment as
+	 * normal.
+	 */
 
-	/* XXX do we want to collect the aggregate IP info from all inners? */
-	// xfrm4_extract_header(skb);
-
-	// assert(!xfrm4_tunnel_check_size(skb));
-	// get the MTU and check it
-	/* we don't have an IP hdr yet */
-	/* if iptfs is set to not fragment (always for now */
-	// if ((ip_hdr(skb)->frag_off & htons(IP_DF)) || skb->ignore_df)
-
-	/* our first skb -- push the iptfs header */
-	h = skb_push(skb, hsz);
-	memset(h, 0, hsz);
-
-	/* actually if IPTFS DF is set */
-	if (1) {
-		/* We've split these up before queuing */
+	if (df) {
+		/* We'be split these up before queuing */
 		BUG_ON(skb_is_gso(skb));
+
+		/* mtu includes all the overhead including the basic header size */
 		if (skb->len > mtu) {
 			/* pop the iptfs header back off */
-			skb_pull(skb, hsz);
-			icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
-				  htonl(mtu - hsz));
+			pr_devinf(
+				"skb: DF too big len %u mtu %d proto %u seq %u\n",
+				(uint)skb->len, mtu, _proto(skb), _seq(skb));
+			XFRM_INC_STATS(dev_net(skb->dev),
+				       LINUX_MIB_XFRMOUTERROR);
+
+			if (skb->sk)
+				xfrm_local_error(skb, mtu);
+			else
+				icmp_send(skb, ICMP_DEST_UNREACH,
+					  ICMP_FRAG_NEEDED, htonl(mtu));
 			return -EMSGSIZE;
 		}
+	} else {
+		pr_devinf(
+			"skb: iptfs-df-not-set len %u mtu %d proto %u seq %u\n",
+			(uint)skb->len, mtu, _proto(skb), _seq(skb));
 	}
+
+	h = skb_push(skb, hsz);
+	memset(h, 0, hsz);
 
 	/*
 	 * network_header current points at the inner IP packet
@@ -1210,6 +1217,10 @@ static int iptfs_first_skb(struct sk_buff *skb)
 
 static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 {
+	bool df = ((struct xfrm_iptfs_data *)x->tfs_data)->cfg.dont_frag;
+	struct sk_buff *skb, *skb2, **nextp;
+	int err;
+
 	/*
 	 * When we do timed output things (locking) will be more complex in the
 	 * presence of fragmentation. But maybe more efficient since there
@@ -1282,22 +1293,25 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 	 *
 	 */
 
-	struct sk_buff *skb, *skb2, **nextp;
-	int err;
-
 	/* and send them on their way */
 
 	while ((skb = __skb_dequeue(list))) {
-		/* XXX we want this from the tunnel outer encap */
 		int remaining = dst_mtu(skb_dst(skb));
 
 		pr_devinf(
 			"1st dequeue skb %p len %u data_len %u proto %u seq %u\n",
 			skb, skb->len, skb->data_len, _proto(skb), _seq(skb));
-		if (iptfs_first_skb(skb))
-			continue;
 
-		remaining -= skb->len;
+		if (iptfs_first_skb(skb, df)) {
+			kfree_skb(skb);
+			continue;
+		}
+
+		/*
+		 * The MTU has the basic IPTFS header len inc, and we added that
+		 * header to the first skb, so subtract from the skb length
+		 */
+		remaining -= (skb->len - sizeof(struct ip_iptfs_hdr));
 
 		nextp = &skb_shinfo(skb)->frag_list;
 		while (*nextp)
@@ -1308,7 +1322,7 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 			skb2 = __skb_dequeue(list);
 
 			pr_devinf(
-				"appendg secondary dequeue skb2 %p len %u data_len %u proto %u seq %u\n",
+				"append secondary dequeue skb2 %p len %u data_len %u proto %u seq %u\n",
 				skb2, skb2->len, skb2->data_len, _proto(skb2),
 				_seq(skb2));
 			// skb_shinfo(skb)->frag_list = skb2;
