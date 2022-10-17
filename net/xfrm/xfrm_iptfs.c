@@ -34,8 +34,14 @@
 #endif
 
 #define XFRM_INC_SA_STATS(xtfs, stat)
+#define XFRM_INC_SA_STATS_N(xtfs, stat, count)
 
 #define IPTFS_HRTIMER_MODE HRTIMER_MODE_REL_SOFT
+
+struct skb_wseq {
+	struct sk_buff *skb;
+	u64 seq;
+};
 
 struct xfrm_iptfs_config {
 	bool dont_frag : 1;
@@ -61,7 +67,8 @@ struct xfrm_iptfs_data {
 	 * Tunnel input reordering.
 	 */
 	u64 win_nseq;	      /* expected next sequence */
-	struct sk_buff **win; /* the reorder window */
+	struct skb_wseq *win; /* the reorder window */
+	uint winlen;	      /* the reorder co */
 	struct spinlock drop_lock;
 	struct hrtimer drop_timer;
 	u64 drop_time_ns;
@@ -98,6 +105,12 @@ static inline uint _seq(struct sk_buff *skb)
 			((struct tcphdr *)((struct iphdr *)skb->data + 1))->seq);
 	else
 		return 0;
+}
+
+static inline u64 __esp_seq(struct sk_buff *skb)
+{
+	u64 seq = ntohl(XFRM_SKB_CB(skb)->seq.input.low);
+	return seq | (u64)ntohl(XFRM_SKB_CB(skb)->seq.input.hi) << 32;
 }
 
 void xfrm_iptfs_get_rtt_and_delays(struct ip_iptfs_cc_hdr *cch, u32 *rtt,
@@ -159,6 +172,7 @@ void xfrm_iptfs_state_destroy(struct xfrm_state *x)
 	if (IS_ERR_OR_NULL(xtfs))
 		return;
 	hrtimer_cancel(&xtfs->iptfs_timer);
+	kfree_sensitive(xtfs->win);
 	kfree_sensitive(xtfs);
 }
 
@@ -179,9 +193,14 @@ int xfrm_iptfs_user_init(struct net *net, struct xfrm_state *x,
 
 	if (attrs[XFRMA_IPTFS_DONT_FRAG])
 		xc->dont_frag = true;
-	if (attrs[XFRMA_IPTFS_REORD_WIN])
-		xc->reorder_win_size =
-			nla_get_u16(attrs[XFRMA_IPTFS_REORD_WIN]);
+	if (attrs[XFRMA_IPTFS_REORD_WIN]) {
+		u16 winsize = nla_get_u16(attrs[XFRMA_IPTFS_REORD_WIN]);
+		xc->reorder_win_size = winsize;
+		/* win array is for saving 1..N seq nums from wantseq */
+		if (winsize > 1)
+			xtfs->win = kvcalloc(winsize - 1, sizeof(*xtfs->win),
+					     GFP_KERNEL);
+	}
 	if (attrs[XFRMA_IPTFS_PKT_SIZE])
 		xc->pkt_size = nla_get_u32(attrs[XFRMA_IPTFS_PKT_SIZE]);
 	if (attrs[XFRMA_IPTFS_MAX_QSIZE])
@@ -663,8 +682,7 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
  * We have an IPTFS payload dispense with it and this skb as well.
  */
 static int iptfs_input_ordered(struct gro_cells *gro_cells,
-			       struct xfrm_state *x, u64 seq,
-			       struct sk_buff *skb)
+			       struct xfrm_state *x, struct sk_buff *skb)
 {
 	u8 hbytes[sizeof(struct ipv6hdr)];
 	struct ip_iptfs_cc_hdr iptcch;
@@ -678,6 +696,7 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 	struct net *net;
 	uint remaining, first_iplen, iplen, iphlen, resv, data, tail;
 	uint blkoff, capturelen;
+	u64 seq;
 	u8 *tmp;
 
 	xtfs = x->tfs_data;
@@ -685,6 +704,7 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 	first_skb = NULL;
 	defer = NULL;
 
+	seq = __esp_seq(skb);
 	pr_devinf("processing skb with len %u seq %llu\n", skb->len, seq);
 
 	/* large enough to hold both types of header */
@@ -987,30 +1007,357 @@ done:
 	return 0;
 }
 
+static void __win_shift(struct xfrm_iptfs_data *xtfs, uint shift)
+{
+	uint winlen = xtfs->winlen;
+
+	shift = max(shift, winlen);
+	if (shift != winlen)
+		memcpy(xtfs->win, xtfs->win + shift, winlen - shift);
+	memset(xtfs->win + winlen - shift, 0, shift);
+	xtfs->winlen -= shift;
+}
+
+static int __reorder_past(struct xfrm_iptfs_data *xtfs, struct sk_buff *inskb,
+			  struct list_head *freelist, uint *fcount)
+{
+	pr_devinf("drop old got %llu want %llu\n", __esp_seq(inskb),
+		  xtfs->win_nseq);
+	XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_OLD_SEQ);
+	list_add_tail(&inskb->list, freelist);
+	(*fcount)++;
+	return 0;
+}
+
+static uint __reorder_this(struct xfrm_iptfs_data *xtfs, struct sk_buff *inskb,
+			   struct list_head *list)
+
+{
+	struct skb_wseq *wnext, *wend;
+	const uint winlen = xtfs->winlen;
+	u64 wantseq = xtfs->win_nseq;
+	uint count = 0;
+
+	/* Got what we wanted. */
+	pr_devinf("got wanted seq %llu\n", wantseq);
+	list_add_tail(&inskb->list, list);
+	wantseq = ++xtfs->win_nseq;
+	count++;
+
+	/*
+	 * Flush any remaining consecutive packets.
+	 */
+
+	if (!winlen) {
+		/* And no out-of-order packets saved. */
+		pr_devinf("all done, no saved out-of-order pkts\n");
+		return count;
+	}
+
+	/* Keep sending until we hit another missed pkt. */
+	wnext = xtfs->win;
+	wend = wnext + winlen;
+	for (; wnext < wend && wnext->skb; wnext++) {
+		pr_devinf("pop next from window %llu\n", wantseq);
+		wantseq = ++xtfs->win_nseq;
+		list_add_tail(&wnext->skb->list, list);
+		count++;
+	}
+	if (wnext == wend)
+		pr_devinf("popped all from window\n");
+
+	/* Shift handled slots, and the final empty slot into slot0. */
+	__win_shift(xtfs, wnext - xtfs->win + 1);
+	return count;
+}
+
+static uint __reorder_future_fits(struct xfrm_iptfs_data *xtfs,
+				  struct sk_buff *inskb,
+				  struct list_head *freelist, uint *fcount)
+{
+	const uint winsize = xtfs->cfg.reorder_win_size;
+	const u64 inseq = __esp_seq(inskb);
+	const u64 wantseq = xtfs->win_nseq;
+	const u64 distance = inseq - wantseq;
+	const uint winlen = xtfs->winlen;
+	const uint index = distance - 1;
+
+	BUG_ON(distance >= winsize);
+
+	/*
+	 * Handle future sequence number received which fits in the window.
+	 *
+	 * We know we don't have the seq we want so we won't be able to flush
+	 * anything.
+	 */
+
+	pr_devinf(
+		"got future seq %llu want %llu distance %llu winlen %u winsize %u\n",
+		inseq, wantseq, distance, winlen, winsize);
+
+	/*
+	 * win size is 4, array size is 3 winlen is 2
+	 *
+	 * "window boundary" is based on the fixed window size
+	 * distance is also slot number
+	 * index is an array index (i.e., - 1 of slot)
+	 * : : - implicit NULL after array ends but winsize still valid
+	 *
+	 *                +-- window boundary (winsize == 4)
+	 *  0   1   2   3 | 4   slot number
+	 * ---  0   1   2 | 3   array index
+	 *     [-] [b] : :|     array
+	 * "2" "3" "4" *5*      seq numbers
+	 *
+	 * We receive seq number 5
+	 * distance == 3 [inseq(5) - win_nseq(2)]
+	 * index == 2 [distance(6) - 1]
+	 */
+
+	if (xtfs->win[index].skb) {
+		/* a dup of a future */
+		pr_devinf("dropping future dup %llu\n", inseq);
+		XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_DUP_SEQ);
+		list_add_tail(&inskb->list, freelist);
+		(*fcount)++;
+		return 0;
+	}
+
+	xtfs->win[index].skb = inskb;
+	return 0;
+}
+
+static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
+				    struct sk_buff *inskb,
+				    struct list_head *list,
+				    struct list_head *freelist, uint *fcount)
+{
+	const uint winsize = xtfs->cfg.reorder_win_size;
+	const u64 inseq = __esp_seq(inskb);
+	uint winlen = xtfs->winlen;
+	u64 wantseq = xtfs->win_nseq;
+	u64 distance = inseq - wantseq;
+	struct sk_buff *slot0 = NULL;
+	u64 start_drop_seq = xtfs->win_nseq;
+	u64 last_drop_seq = xtfs->win_nseq;
+	uint count = 0;
+	uint missed = 0;
+	struct skb_wseq *wnext;
+	uint beyond;
+
+	/*
+	 * Handle future sequence number received.
+	 *
+	 * IMPORTANT: we are at least advancing win_nseq (i.e., wantseq) by 1
+	 * b/c we are beyond the window boundary.
+	 *
+	 * We know we don't have the wantseq so that counts as a drop.
+	 */
+
+	pr_devinf(
+		"got future seq %llu want %llu distance %llu winlen %u winsize %u\n",
+		inseq, wantseq, distance, winlen, winsize);
+
+	/*
+	 * win size is 4, array size is 3 winlen is 2
+	 *
+	 * beyond is beyond array size not winlen.
+	 *
+	 *                +-- window boundary (winsize == 4)
+	 *  0   1   2   3 | 4   slot number
+	 * ---  0   1   2 | 3   array index
+	 *     [b] [c] : :|     array
+	 * "2" "3" "4" "5" *6*  seq numbers
+	 *
+	 * We receive seq number 6
+	 * distance == 4 [inseq(6) - win_nseq(2)]
+	 * index == 3 [distance(6) - 1]
+	 * beyond == 1 [slot(4) - lastslot((winsize(4) - 1))]
+	 * nent == 1 [min(winlen(2), beyond(3)]
+	 * slot0_skb == [b], and should match win_nseq
+	 *
+	 *                +-- window boundary (winsize == 4)
+	 *  0   1   2   3 | 4   5   6   slot number
+	 * ---  0   1   2 | 3   4   5   array index
+	 *     [-] [c] : :|             array
+	 * "2" "3" "4" "5" "6" "7" *8*  seq numbers
+	 *
+	 * winlen = 2, beyond = 3
+	 * iter 1: slot0 == NULL, missed++, lastdrop = 2 (2+1-1), slot0 = [-]
+	 * iter 2: slot0 == NULL, missed++, lastdrop = 3 (2+2-1), slot0 = [c]
+	 * 2 < 3, extra = 1 (3-2), missed += extra, lastdrop = 4 (2+2+1-1)
+	 *
+	 * We receive seq number 8
+	 * distance == 6 [inseq(8) - win_nseq(2)]
+	 * index == 5 [distance(6) - 1]
+	 * beyond == 3 [slot(6) - lastslot((winsize(4) - 1))]
+	 * nent == 2 [min(winlen(2), beyond(3)]
+	 * slot0_skb == NULL changed from [b] when "winlen < beyond" is true.
+	 */
+
+	beyond = distance + 1 - winsize;
+
+	BUG_ON(beyond == 0);
+	BUG_ON(winlen == 0);
+	BUG_ON(winlen > beyond);
+
+	/*
+	 * Now send any packets and account for missing packets that are exiting
+	 * the window as we shift it.
+	 */
+
+	/* If winlen < beyond we are shifting some, else all. */
+	uint slot, nent = beyond < winlen ? beyond : winlen;
+
+	/* the first iteration will count the current missing slot0 */
+	slot0 = NULL;
+	wnext = xtfs->win;
+	for (slot = 1; slot <= nent; slot++, wnext++) {
+		if (!slot0) {
+			missed++;
+			last_drop_seq = xtfs->win_nseq + slot - 1;
+			pr_devinf("drop empty slot while adv window: %llu",
+				  last_drop_seq);
+		} else {
+			pr_devinf("send slot while adv window: %llu",
+				  xtfs->win_nseq + slot - 1);
+
+			list_add_tail(&slot0->list, list);
+			count++;
+		}
+		slot0 = wnext->skb;
+		wnext->skb = NULL;
+	}
+	/* Handle sliding the window more than winlen. */
+	if (winlen < beyond) {
+		uint extra_drops = beyond - winlen;
+		if (!slot0)
+			extra_drops++;
+		else {
+			pr_devinf("send slot before skip: %llu",
+				  xtfs->win_nseq + slot - 1);
+			list_add_tail(&slot0->list, list);
+			count++;
+		}
+		missed += extra_drops;
+		last_drop_seq = xtfs->win_nseq + nent + extra_drops;
+		slot0 = NULL;
+	}
+
+	/* Remove the entries */
+	__win_shift(xtfs, beyond);
+
+	/* Advance want seq */
+	xtfs->win_nseq += beyond;
+
+	/*
+	 * Process drops here when implementing congestion control
+	 */
+	XFRM_INC_SA_STATS_N(xtfs, IPTFS_INPUT_MISSED_SEQ, missed);
+	if (missed)
+		pr_devinf("drop start seq %llu last seq %llu\n", start_drop_seq,
+			  last_drop_seq);
+
+	/* We've shifted. plug the packet in at the end. */
+	xtfs->winlen = winsize - 1;
+	xtfs->win[xtfs->winlen - 1].skb = inskb;
+
+	/* if we don't have a slot0 then we must wait for it */
+	if (!slot0)
+		return count;
+
+	/* If slot0, seq must match new want seq */
+	BUG_ON(xtfs->win_nseq != __esp_seq(slot0));
+
+	/*
+	 * slot0 is valid, treat like we received expected.
+	 */
+	count += __reorder_this(xtfs, slot0, list);
+	return count;
+}
+
+/*
+ * Receive a new packet into the reorder window. Return a list of ordered
+ * packets from the window.
+ */
+static uint iptfs_input_reorder(struct xfrm_iptfs_data *xtfs,
+				struct sk_buff *inskb, struct list_head *list,
+				struct list_head *freelist, uint *fcount)
+{
+	const uint winsize = xtfs->cfg.reorder_win_size;
+	u64 inseq = __esp_seq(inskb);
+	u64 wantseq = xtfs->win_nseq;
+
+	assert_spin_locked(&xtfs->drop_lock);
+
+	pr_devinf("recv reorder: inseq %llu want %llu winlen %u skblen %u\n",
+		  inseq, wantseq, xtfs->winlen, inskb->len);
+
+	/* Handle not reordering. */
+	if (!wantseq) {
+		BUG_ON(xtfs->winlen);
+		pr_devinf("reorder disabled on arrival");
+		list_add_tail(&inskb->list, list);
+		return 1;
+	}
+
+	if (likely(inseq == wantseq))
+		return __reorder_this(xtfs, inskb, list);
+	else if (inseq < wantseq)
+		return __reorder_past(xtfs, inskb, freelist, fcount);
+	else if ((inseq - wantseq) < winsize)
+		return __reorder_future_fits(xtfs, inskb, freelist, fcount);
+	else
+		return __reorder_future_shifts(xtfs, inskb, list, freelist,
+					       fcount);
+}
+
 /*
  * We have an IPTFS payload order it if needed.
  */
 int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 		     struct sk_buff *skb)
 {
+	struct list_head freelist, list;
 	struct xfrm_iptfs_data *xtfs = x->tfs_data;
-	u64 seq;
+	struct sk_buff *next;
+	uint count, fcount;
 
-	seq = ntohl(XFRM_SKB_CB(skb)->seq.input.low);
-	seq |= (u64)ntohl(XFRM_SKB_CB(skb)->seq.input.hi) << 32;
-
-	/*
-	 * XXX We need a lock here somewhere to guarantee ordering
-	 */
-
-	if (xtfs->cfg.reorder_win_size == 0)
-		return iptfs_input_ordered(gro_cells, x, seq, skb);
+	/* Fast path for no reorder window. */
+	if (xtfs->cfg.reorder_win_size == 0) {
+		iptfs_input_ordered(gro_cells, x, skb);
+		return 0;
+	}
 
 	/*
-	 * XXX fetch the next N input packets from the reordering window
+	 * Fetch list of in-order packets from the reordering window as well as
+	 * a list of buffers we need to now free.
 	 */
+	INIT_LIST_HEAD(&list);
+	INIT_LIST_HEAD(&freelist);
+	fcount = 0;
 
-	return iptfs_input_ordered(gro_cells, x, seq, skb);
+	spin_lock(&xtfs->drop_lock);
+	count = iptfs_input_reorder(xtfs, skb, &list, &freelist, &fcount);
+	spin_unlock(&xtfs->drop_lock);
+
+	if (count) {
+		pr_devinf("receiving ordered list of len %u\n", count);
+		list_for_each_entry_safe (skb, next, &list, list) {
+			skb_list_del_init(skb);
+			(void)iptfs_input_ordered(gro_cells, x, skb);
+		}
+	}
+
+	if (fcount) {
+		pr_devinf("freeing list of len %u\n", fcount);
+		list_for_each_entry_safe (skb, next, &freelist, list) {
+			skb_list_del_init(skb);
+			kfree_skb(skb);
+			return 0;
+		}
+	}
+	return 0;
 }
 
 /* --------------------------------- */
