@@ -26,11 +26,15 @@
 /* #define IPTFS_ENET_OHEAD (14 + 4 + 8 + 12) */
 /* #define GE_PPS(ge, iptfs_ip_mtu) ((1e8 * 10 ^ (ge - 1) / 8) / (iptfs_ip_mtu)) */
 
-#undef PR_DEBUG_INFO
+#define PR_DEBUG_INFO
+#define PR_DEBUG_STATE
+#undef PR_DEBUG_INGRESS
+#define PR_DEBUG_EGRESS
+
 #ifdef PR_DEBUG_INFO
-#define pr_devinf(...) pr_info(__VA_ARGS__)
+#define _pr_devinf(...) pr_info(__VA_ARGS__)
 #else
-#define pr_devinf(...) pr_devel(__VA_ARGS__)
+#define _pr_devinf(...) pr_devel(__VA_ARGS__)
 #endif
 
 #define XFRM_INC_SA_STATS(xtfs, stat)
@@ -137,6 +141,12 @@ void xfrm_iptfs_get_rtt_and_delays(struct ip_iptfs_cc_hdr *cch, u32 *rtt,
 
 #undef pr_fmt
 #define pr_fmt(fmt) "%s: STATE: " fmt, __func__
+#undef pr_devinfo
+#ifdef PR_DEBUG_STATE
+#define pr_devinf(...) _pr_devinf(__VA_ARGS__)
+#else
+#define pr_devinf(...)
+#endif
 
 int xfrm_iptfs_init_state(struct xfrm_state *x)
 {
@@ -244,6 +254,12 @@ int xfrm_iptfs_copy_to_user_state(struct xfrm_state *x, struct sk_buff *skb)
 
 #undef pr_fmt
 #define pr_fmt(fmt) "%s: EGRESS: " fmt, __func__
+#undef pr_devinf
+#ifdef PR_DEBUG_EGRESS
+#define pr_devinf(...) _pr_devinf(__VA_ARGS__)
+#else
+#define pr_devinf(...)
+#endif
 
 struct sk_buff *skb_at_offset(struct sk_buff *skb, uint offset, uint len)
 {
@@ -1366,6 +1382,12 @@ int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 
 #undef pr_fmt
 #define pr_fmt(fmt) "%s: INGRESS: " fmt, __func__
+#undef pr_devinf
+#ifdef PR_DEBUG_INGRESS
+#define pr_devinf(...) _pr_devinf(__VA_ARGS__)
+#else
+#define pr_devinf(...)
+#endif
 
 /*
  * Check to see if it's OK to queue a packet for sending on tunnel.
