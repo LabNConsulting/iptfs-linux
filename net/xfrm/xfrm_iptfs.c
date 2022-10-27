@@ -114,7 +114,8 @@ static inline uint _seq(struct sk_buff *skb)
 static inline u64 __esp_seq(struct sk_buff *skb)
 {
 	u64 seq = ntohl(XFRM_SKB_CB(skb)->seq.input.low);
-	return seq | (u64)ntohl(XFRM_SKB_CB(skb)->seq.input.hi) << 32;
+	return seq;
+	// return seq | (u64)ntohl(XFRM_SKB_CB(skb)->seq.input.hi) << 32;
 }
 
 void xfrm_iptfs_get_rtt_and_delays(struct ip_iptfs_cc_hdr *cch, u32 *rtt,
@@ -203,14 +204,13 @@ int xfrm_iptfs_user_init(struct net *net, struct xfrm_state *x,
 
 	if (attrs[XFRMA_IPTFS_DONT_FRAG])
 		xc->dont_frag = true;
-	if (attrs[XFRMA_IPTFS_REORD_WIN]) {
-		u16 winsize = nla_get_u16(attrs[XFRMA_IPTFS_REORD_WIN]);
-		xc->reorder_win_size = winsize;
-		/* win array is for saving 1..N seq nums from wantseq */
-		if (winsize > 1)
-			xtfs->win = kvcalloc(winsize - 1, sizeof(*xtfs->win),
-					     GFP_KERNEL);
-	}
+	if (attrs[XFRMA_IPTFS_REORD_WIN])
+		xc->reorder_win_size =
+			nla_get_u16(attrs[XFRMA_IPTFS_REORD_WIN]);
+	/* win array is for saving 1..N seq nums from wantseq */
+	if (xc->reorder_win_size > 1)
+		xtfs->win = kcalloc(xc->reorder_win_size - 1,
+				    sizeof(*xtfs->win), GFP_KERNEL);
 	if (attrs[XFRMA_IPTFS_PKT_SIZE])
 		xc->pkt_size = nla_get_u32(attrs[XFRMA_IPTFS_PKT_SIZE]);
 	if (attrs[XFRMA_IPTFS_MAX_QSIZE])
@@ -1027,10 +1027,12 @@ static void __win_shift(struct xfrm_iptfs_data *xtfs, uint shift)
 {
 	uint winlen = xtfs->winlen;
 
-	shift = max(shift, winlen);
-	if (shift != winlen)
-		memcpy(xtfs->win, xtfs->win + shift, winlen - shift);
-	memset(xtfs->win + winlen - shift, 0, shift);
+	shift = min(shift, winlen);
+	if (shift != winlen) {
+		memcpy(xtfs->win, xtfs->win + shift,
+		       (winlen - shift) * sizeof(*xtfs->win));
+	}
+	memset(xtfs->win + winlen - shift, 0, shift * sizeof(*xtfs->win));
 	xtfs->winlen -= shift;
 }
 
@@ -1055,7 +1057,7 @@ static uint __reorder_this(struct xfrm_iptfs_data *xtfs, struct sk_buff *inskb,
 	uint count = 0;
 
 	/* Got what we wanted. */
-	pr_devinf("got wanted seq %llu\n", wantseq);
+	pr_devinf("got wanted seq %llu winlen %u\n", wantseq, winlen);
 	list_add_tail(&inskb->list, list);
 	wantseq = ++xtfs->win_nseq;
 	count++;
@@ -1140,6 +1142,7 @@ static uint __reorder_future_fits(struct xfrm_iptfs_data *xtfs,
 	}
 
 	xtfs->win[index].skb = inskb;
+	xtfs->winlen = max(winlen, index + 1);
 	return 0;
 }
 
@@ -1308,14 +1311,6 @@ static uint iptfs_input_reorder(struct xfrm_iptfs_data *xtfs,
 
 	pr_devinf("recv reorder: inseq %llu want %llu winlen %u skblen %u\n",
 		  inseq, wantseq, xtfs->winlen, inskb->len);
-
-	/* Handle not reordering. */
-	if (!wantseq) {
-		BUG_ON(xtfs->winlen);
-		pr_devinf("reorder disabled on arrival");
-		list_add_tail(&inskb->list, list);
-		return 1;
-	}
 
 	if (likely(inseq == wantseq))
 		return __reorder_this(xtfs, inskb, list);
