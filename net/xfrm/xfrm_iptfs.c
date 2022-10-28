@@ -1028,11 +1028,11 @@ static void __vec_shift(struct xfrm_iptfs_data *xtfs, uint shift)
 {
 	uint savedlen = xtfs->w_savedlen;
 
-	shift = min(shift, savedlen);
-	if (shift != savedlen) {
+	if (shift > savedlen)
+		shift = savedlen;
+	if (shift != savedlen)
 		memcpy(xtfs->w_saved, xtfs->w_saved + shift,
 		       (savedlen - shift) * sizeof(*xtfs->w_saved));
-	}
 	memset(xtfs->w_saved + savedlen - shift, 0,
 	       shift * sizeof(*xtfs->w_saved));
 	xtfs->w_savedlen -= shift;
@@ -1053,7 +1053,7 @@ static uint __reorder_this(struct xfrm_iptfs_data *xtfs, struct sk_buff *inskb,
 			   struct list_head *list)
 
 {
-	struct skb_wseq *wnext, *wend;
+	struct skb_wseq *s, *se;
 	const uint savedlen = xtfs->w_savedlen;
 	u64 wantseq = xtfs->w_wantseq;
 	uint count = 0;
@@ -1062,33 +1062,28 @@ static uint __reorder_this(struct xfrm_iptfs_data *xtfs, struct sk_buff *inskb,
 	pr_devinf("got wanted seq %llu savedlen %u\n", wantseq, savedlen);
 	list_add_tail(&inskb->list, list);
 	wantseq = ++xtfs->w_wantseq;
-	count++;
+	if (!savedlen) {
+		pr_devinf("all done, no saved out-of-order pkts\n");
+		return 1;
+	}
 
 	/*
-	 * Flush any remaining consecutive packets.
+	 * Flush remaining consecutive packets.
 	 */
 
-	if (!savedlen) {
-		/* And no out-of-order packets saved. */
-		pr_devinf("all done, no saved out-of-order pkts\n");
-		return count;
-	}
-
 	/* Keep sending until we hit another missed pkt. */
-	wnext = xtfs->w_saved;
-	wend = wnext + savedlen;
-	for (; wnext < wend && wnext->skb; wnext++) {
-		pr_devinf("pop next from window %llu\n", wantseq);
-		wantseq = ++xtfs->w_wantseq;
-		list_add_tail(&wnext->skb->list, list);
-		count++;
+	for (s = xtfs->w_saved, se = s + savedlen; s < se && s->skb; s++)
+		list_add_tail(&s->skb->list, list);
+	count = s - xtfs->w_saved;
+	if (count) {
+		xtfs->w_wantseq += count;
+		pr_devinf("popped seq %llu to %llu from saved%s\n", wantseq,
+			  xtfs->w_wantseq - 1,
+			  count == savedlen ? " (all)" : "");
 	}
-	if (wnext == wend)
-		pr_devinf("popped all from window\n");
-
-	/* Shift handled slots, and the final empty slot into slot0. */
-	__vec_shift(xtfs, wnext - xtfs->w_saved + 1);
-	return count;
+	/* Shift handled slots plus final empty slot into slot 0. */
+	__vec_shift(xtfs, count + 1);
+	return count + 1;
 }
 
 static uint __reorder_future_fits(struct xfrm_iptfs_data *xtfs,
@@ -1169,7 +1164,7 @@ static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 	uint count = 0;
 	uint missed = 0;
 	struct skb_wseq *wnext;
-	uint beyond;
+	uint beyond, nent, slot;
 
 	/*
 	 * Handle future sequence number received.
@@ -1238,7 +1233,7 @@ static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 	 */
 
 	/* If savedlen < beyond we are shifting some, else all. */
-	uint slot, nent = beyond < savedlen ? beyond : savedlen;
+	nent = beyond < savedlen ? beyond : savedlen;
 
 	/* the first iteration will count the current missing slot0 */
 	slot0 = NULL;
