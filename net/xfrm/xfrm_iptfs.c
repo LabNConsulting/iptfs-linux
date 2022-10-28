@@ -208,8 +208,8 @@ int xfrm_iptfs_user_init(struct net *net, struct xfrm_state *x,
 		xc->reorder_win_size =
 			nla_get_u16(attrs[XFRMA_IPTFS_REORD_WIN]);
 	/* saved array is for saving 1..N seq nums from wantseq */
-	if (xc->reorder_win_size > 1)
-		xtfs->w_saved = kcalloc(xc->reorder_win_size - 1,
+	if (xc->reorder_win_size)
+		xtfs->w_saved = kcalloc(xc->reorder_win_size,
 					sizeof(*xtfs->w_saved), GFP_KERNEL);
 	if (attrs[XFRMA_IPTFS_PKT_SIZE])
 		xc->pkt_size = nla_get_u32(attrs[XFRMA_IPTFS_PKT_SIZE]);
@@ -1024,10 +1024,13 @@ done:
 	return 0;
 }
 
-static void __vec_shift(struct xfrm_iptfs_data *xtfs, uint shift)
+static void __vec_shift(struct xfrm_iptfs_data *xtfs, u64 shift)
 {
 	uint savedlen = xtfs->w_savedlen;
-
+#if UINTPTR_MAX != UINT_MAX
+	if (shift > UINT_MAX)
+		shift = UINT_MAX;
+#endif
 	if (shift > savedlen)
 		shift = savedlen;
 	if (shift != savedlen)
@@ -1090,14 +1093,14 @@ static uint __reorder_future_fits(struct xfrm_iptfs_data *xtfs,
 				  struct sk_buff *inskb,
 				  struct list_head *freelist, uint *fcount)
 {
-	const uint winsize = xtfs->cfg.reorder_win_size;
+	const uint nslots = xtfs->cfg.reorder_win_size + 1;
 	const u64 inseq = __esp_seq(inskb);
 	const u64 wantseq = xtfs->w_wantseq;
 	const u64 distance = inseq - wantseq;
 	const uint savedlen = xtfs->w_savedlen;
 	const uint index = distance - 1;
 
-	BUG_ON(distance >= winsize);
+	BUG_ON(distance >= nslots);
 
 	/*
 	 * Handle future sequence number received which fits in the window.
@@ -1107,20 +1110,20 @@ static uint __reorder_future_fits(struct xfrm_iptfs_data *xtfs,
 	 */
 
 	pr_devinf(
-		"got future seq %llu want %llu distance %llu savedlen %u winsize %u\n",
-		inseq, wantseq, distance, savedlen, winsize);
+		"got future seq %llu want %llu distance %llu savedlen %u nslots %u\n",
+		inseq, wantseq, distance, savedlen, nslots);
 
 	/*
-	 * win size is 4, saved size is 3 savedlen is 2
+	 * slot count is 4, saved size is 3 savedlen is 2
 	 *
 	 * "window boundary" is based on the fixed window size
 	 * distance is also slot number
 	 * index is an array index (i.e., - 1 of slot)
-	 * : : - implicit NULL after array ends but winsize still valid
+	 * : : - implicit NULL after array len
 	 *
 	 *          +--------- used length (savedlen == 2)
-	 *          |   +----- array size (winsize - 1 == 3)
-	 *          |   |   + window boundary (winsize == 4)
+	 *          |   +----- array size (nslots - 1 == 3)
+	 *          |   |   + window boundary (nslots == 4)
 	 *          V   V | V
 	 *                |
 	 *  0   1   2   3 |   slot number
@@ -1130,7 +1133,7 @@ static uint __reorder_future_fits(struct xfrm_iptfs_data *xtfs,
 	 * "2" "3" "4" *5*|   seq numbers
 	 *
 	 * We receive seq number 5
-	 * distance == 3 [inseq(5) - win_wantseq(2)]
+	 * distance == 3 [inseq(5) - w_wantseq(2)]
 	 * index == 2 [distance(6) - 1]
 	 */
 
@@ -1153,40 +1156,47 @@ static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 				    struct list_head *list,
 				    struct list_head *freelist, uint *fcount)
 {
-	const uint winsize = xtfs->cfg.reorder_win_size;
+	const uint nslots = xtfs->cfg.reorder_win_size + 1;
 	const u64 inseq = __esp_seq(inskb);
 	uint savedlen = xtfs->w_savedlen;
 	u64 wantseq = xtfs->w_wantseq;
-	u64 distance = inseq - wantseq;
 	struct sk_buff *slot0 = NULL;
 	u64 start_drop_seq = xtfs->w_wantseq;
 	u64 last_drop_seq = xtfs->w_wantseq;
+	u64 distance, extra_drops, missed, s0seq;
 	uint count = 0;
-	uint missed = 0;
 	struct skb_wseq *wnext;
-	uint beyond, nent, slot;
+	uint beyond, shifting, slot;
+
+	BUG_ON(inseq <= wantseq);
+	distance = inseq - wantseq;
+	BUG_ON(distance <= nslots - 1);
+	beyond = distance - (nslots - 1);
+	missed = 0;
 
 	/*
 	 * Handle future sequence number received.
 	 *
-	 * IMPORTANT: we are at least advancing win_wantseq (i.e., wantseq) by 1
+	 * IMPORTANT: we are at least advancing w_wantseq (i.e., wantseq) by 1
 	 * b/c we are beyond the window boundary.
 	 *
 	 * We know we don't have the wantseq so that counts as a drop.
 	 */
 
 	pr_devinf(
-		"got future seq %llu want %llu distance %llu savedlen %u winsize %u\n",
-		inseq, wantseq, distance, savedlen, winsize);
+		"got future seq %llu want %llu distance %llu savedlen %u nslots %u\n",
+		inseq, wantseq, distance, savedlen, nslots);
 
 	/*
-	 * ex: win size is 4, array size is 3 savedlen is 2
+	 * ex: slot count is 4, array size is 3 savedlen is 2
+	 *
+	 * the final slot at savedlen (index savelen - 1) is always occupied.
 	 *
 	 * beyond is "beyond array size" not savedlen.
 	 *
 	 *          +--------- array length (savedlen == 2)
-	 *          |   +----- array size (winsize - 1 == 3)
-	 *          |   |   +- window boundary (winsize == 4)
+	 *          |   +----- array size (nslots - 1 == 3)
+	 *          |   |   +- window boundary (nslots == 4)
 	 *          V   V | V
 	 *                |
 	 *  0   1   2   3 |   slot number
@@ -1196,13 +1206,26 @@ static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 	 * "2" "3" "4" "5"|*6*  seq numbers
 	 *
 	 * We receive seq number 6
-	 * distance == 4 [inseq(6) - win_wantseq(2)]
+	 * distance == 4 [inseq(6) - w_wantseq(2)]
 	 * index == 3 [distance(6) - 1]
-	 * beyond == 1 [slot(4) - lastslot((winsize(4) - 1))]
-	 * nent == 1 [min(savedlen(2), beyond(3)]
-	 * slot0_skb == [b], and should match win_wantseq
+	 * beyond == 1 [slot(4) - lastslot((nslots(4) - 1))]
+	 * shifting == 1 [min(savedlen(2), beyond(3)]
+	 * slot0_skb == [b], and should match w_wantseq
 	 *
-	 *                +-- window boundary (winsize == 4)
+	 *                +--- window boundary (nslots == 4)
+	 *  0   1   2   3 | 4   slot number
+	 * ---  0   1   2 | 3   array index
+	 *     [b] : : : :|     array
+	 * "2" "3" "4" "5" *6*  seq numbers
+	 *
+	 * We receive seq number 6
+	 * distance == 4 [inseq(6) - w_wantseq(2)]
+	 * index == 3 [distance(4) - 1]
+	 * beyond == 1 [slot(4) - lastslot((nslots(4) - 1))]
+	 * shifting == 1 [min(savedlen(1), beyond(1)]
+	 * slot0_skb == [b] and should match w_wantseq
+	 *
+	 *                +-- window boundary (nslots == 4)
 	 *  0   1   2   3 | 4   5   6   slot number
 	 * ---  0   1   2 | 3   4   5   array index
 	 *     [-] [c] : :|             array
@@ -1214,59 +1237,68 @@ static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 	 * 2 < 3, extra = 1 (3-2), missed += extra, lastdrop = 4 (2+2+1-1)
 	 *
 	 * We receive seq number 8
-	 * distance == 6 [inseq(8) - win_wantseq(2)]
+	 * distance == 6 [inseq(8) - w_wantseq(2)]
 	 * index == 5 [distance(6) - 1]
-	 * beyond == 3 [slot(6) - lastslot((winsize(4) - 1))]
-	 * nent == 2 [min(savedlen(2), beyond(3)]
+	 * beyond == 3 [slot(6) - lastslot((nslots(4) - 1))]
+	 * shifting == 2 [min(savedlen(2), beyond(3)]
 	 * slot0_skb == NULL changed from [b] when "savedlen < beyond" is true.
 	 */
 
-	beyond = distance + 1 - winsize;
-
-	BUG_ON(beyond == 0);
-	BUG_ON(savedlen == 0);
-	BUG_ON(savedlen > beyond);
-
 	/*
-	 * Now send any packets and account for missing packets that are exiting
-	 * the window as we shift it.
+	 * Now send any packets that are being shifted out of saved, and account
+	 * for missing packets that are exiting the window as we shift it.
 	 */
 
 	/* If savedlen < beyond we are shifting some, else all. */
-	nent = beyond < savedlen ? beyond : savedlen;
+	shifting = min(savedlen, beyond);
 
-	/* the first iteration will count the current missing slot0 */
+	/* slot0 is the buf that just shifted out and into slot0 */
 	slot0 = NULL;
+	s0seq = wantseq;
 	wnext = xtfs->w_saved;
-	for (slot = 1; slot <= nent; slot++, wnext++) {
+	for (slot = 1; slot <= shifting; slot++, wnext++) {
+		/* handle what was in slot0 before we occupy it */
 		if (!slot0) {
+			pr_devinf("drop slot0 during shift: %llu", s0seq);
+			last_drop_seq = s0seq;
 			missed++;
-			last_drop_seq = xtfs->w_wantseq + slot - 1;
-			pr_devinf("drop empty slot while adv window: %llu",
-				  last_drop_seq);
 		} else {
-			pr_devinf("send slot while adv window: %llu",
-				  xtfs->w_wantseq + slot - 1);
-
+			pr_devinf("send slot0 during shift: %llu", s0seq);
 			list_add_tail(&slot0->list, list);
 			count++;
 		}
+		s0seq++;
 		slot0 = wnext->skb;
 		wnext->skb = NULL;
 	}
-	/* Handle sliding the window more than savedlen. */
+
+	/*
+	 * slot0 is now either NULL (in which case it's what we now are waiting
+	 * for, or a buf in which case we need to handle it like we received it.
+	 */
+
+	/*
+	 * Handle case where we need to shift more than we had saved, slot0 will
+	 * be NULL iff savedlen is 0, otherwise slot0 will always be
+	 * non-NULL b/c we shifted the final element, which is always set if
+	 * there is any saved, into slot0.
+	 */
 	if (savedlen < beyond) {
-		uint extra_drops = beyond - savedlen;
-		if (!slot0)
+		extra_drops = beyond - savedlen;
+		if (savedlen == 0) {
+			BUG_ON(slot0);
 			extra_drops++;
-		else {
-			pr_devinf("send slot before skip: %llu",
-				  xtfs->w_wantseq + slot - 1);
+			pr_devinf("no slot0 skipping %llu more", extra_drops);
+		} else {
+			BUG_ON(!slot0);
+			pr_devinf("send slot0: %llu and skipping %llu more",
+				  s0seq, extra_drops);
 			list_add_tail(&slot0->list, list);
 			count++;
 		}
+
 		missed += extra_drops;
-		last_drop_seq = xtfs->w_wantseq + nent + extra_drops;
+		last_drop_seq = s0seq + extra_drops;
 		slot0 = NULL;
 	}
 
@@ -1285,7 +1317,7 @@ static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 			  last_drop_seq);
 
 	/* We've shifted. plug the packet in at the end. */
-	xtfs->w_savedlen = winsize - 1;
+	xtfs->w_savedlen = nslots - 1;
 	xtfs->w_saved[xtfs->w_savedlen - 1].skb = inskb;
 
 	/* if we don't have a slot0 then we must wait for it */
@@ -1298,6 +1330,7 @@ static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 	/*
 	 * slot0 is valid, treat like we received expected.
 	 */
+	pr_devinf("have slot0 after shift, process as received:u%llu\n", s0seq);
 	count += __reorder_this(xtfs, slot0, list);
 	return count;
 }
@@ -1310,7 +1343,7 @@ static uint iptfs_input_reorder(struct xfrm_iptfs_data *xtfs,
 				struct sk_buff *inskb, struct list_head *list,
 				struct list_head *freelist, uint *fcount)
 {
-	const uint winsize = xtfs->cfg.reorder_win_size;
+	const uint nslots = xtfs->cfg.reorder_win_size + 1;
 	u64 inseq = __esp_seq(inskb);
 	u64 wantseq = xtfs->w_wantseq;
 
@@ -1323,7 +1356,7 @@ static uint iptfs_input_reorder(struct xfrm_iptfs_data *xtfs,
 		return __reorder_this(xtfs, inskb, list);
 	else if (inseq < wantseq)
 		return __reorder_past(xtfs, inskb, freelist, fcount);
-	else if ((inseq - wantseq) < winsize)
+	else if ((inseq - wantseq) < nslots)
 		return __reorder_future_fits(xtfs, inskb, freelist, fcount);
 	else
 		return __reorder_future_shifts(xtfs, inskb, list, freelist,
