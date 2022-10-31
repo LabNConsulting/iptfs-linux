@@ -70,7 +70,8 @@ struct xfrm_iptfs_data {
 	/*
 	 * Tunnel input reordering.
 	 */
-	u64 w_wantseq;		 /* expected next sequence */
+	bool w_seq_set;		  /* true after first seq received */
+	u64 w_wantseq;		  /* expected next sequence */
 	struct skb_wseq *w_saved; /* the saved buf array */
 	uint w_savedlen;	  /* the saved len (not size) */
 	struct spinlock drop_lock;
@@ -1345,9 +1346,17 @@ static uint iptfs_input_reorder(struct xfrm_iptfs_data *xtfs,
 {
 	const uint nslots = xtfs->cfg.reorder_win_size + 1;
 	u64 inseq = __esp_seq(inskb);
-	u64 wantseq = xtfs->w_wantseq;
+	u64 wantseq;
 
 	assert_spin_locked(&xtfs->drop_lock);
+
+	if (unlikely(!xtfs->w_seq_set)) {
+		pr_devinf("recv reorder: first packet inseq %llu skblen %u\n",
+			  inseq, inskb->len);
+		xtfs->w_seq_set = true;
+		xtfs->w_wantseq = inseq;
+	}
+	wantseq = xtfs->w_wantseq;
 
 	pr_devinf("recv reorder: inseq %llu want %llu savedlen %u skblen %u\n",
 		  inseq, wantseq, xtfs->w_savedlen, inskb->len);
