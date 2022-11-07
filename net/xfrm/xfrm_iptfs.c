@@ -66,7 +66,8 @@ struct xfrm_iptfs_data {
 	u32 queue_size;		    /* octets */
 	u64 init_delay_ns;	    /* nanoseconds */
 	struct hrtimer iptfs_timer; /* output timer */
-	time64_t iptfs_settime;
+	time64_t iptfs_settime;	    /* time timer was set */
+	uint payload_mtu;	    /* max payload size */
 	/*
 	 * Tunnel input reordering.
 	 */
@@ -89,9 +90,9 @@ struct xfrm_iptfs_data {
 static enum hrtimer_restart iptfs_delay_timer(struct hrtimer *me);
 static enum hrtimer_restart iptfs_drop_timer(struct hrtimer *me);
 
-/* ----------------- */
+/* ================= */
 /* Utility Functions */
-/* ----------------- */
+/* ================= */
 
 static inline uint _proto(struct sk_buff *skb)
 {
@@ -108,6 +109,9 @@ static inline uint _seq(struct sk_buff *skb)
 	else if (protocol == IPPROTO_TCP)
 		return ntohl(
 			((struct tcphdr *)((struct iphdr *)skb->data + 1))->seq);
+	else if (protocol == IPPROTO_UDP)
+		return ntohs(((struct udphdr *)((struct iphdr *)skb->data + 1))
+				     ->source);
 	else
 		return 0;
 }
@@ -137,9 +141,9 @@ void xfrm_iptfs_get_rtt_and_delays(struct ip_iptfs_cc_hdr *cch, u32 *rtt,
 		      cch->adelay2_and_xdelay[3];
 }
 
-/* -------------------------- */
+/* ========================== */
 /* State Management Functions */
-/* -------------------------- */
+/* ========================== */
 
 #undef pr_fmt
 #define pr_fmt(fmt) "%s: STATE: " fmt, __func__
@@ -212,8 +216,20 @@ int xfrm_iptfs_user_init(struct net *net, struct xfrm_state *x,
 	if (xc->reorder_win_size)
 		xtfs->w_saved = kcalloc(xc->reorder_win_size,
 					sizeof(*xtfs->w_saved), GFP_KERNEL);
-	if (attrs[XFRMA_IPTFS_PKT_SIZE])
+	if (attrs[XFRMA_IPTFS_PKT_SIZE]) {
 		xc->pkt_size = nla_get_u32(attrs[XFRMA_IPTFS_PKT_SIZE]);
+		if (!xc->pkt_size)
+			xtfs->payload_mtu = 0;
+		else if (xc->pkt_size > x->props.header_len)
+			xtfs->payload_mtu = xc->pkt_size - x->props.header_len;
+		else {
+			pr_err("requested iptfs pkt-size %u <= packet header len %u\n",
+			       xc->pkt_size, x->props.header_len);
+			return EINVAL;
+		}
+		pr_devinf("IPTFS pkt-size %u => payload_mtu %u\n", xc->pkt_size,
+			  xtfs->payload_mtu);
+	}
 	if (attrs[XFRMA_IPTFS_MAX_QSIZE])
 		xc->max_queue_size = nla_get_u32(attrs[XFRMA_IPTFS_MAX_QSIZE]);
 	if (attrs[XFRMA_IPTFS_DROP_TIME]) {
@@ -249,9 +265,9 @@ int xfrm_iptfs_copy_to_user_state(struct xfrm_state *x, struct sk_buff *skb)
 	return ret;
 }
 
-/* ---------------------------------- */
+/* ================================== */
 /* IPTFS Receiving (egress) Functions */
-/* ---------------------------------- */
+/* ================================== */
 
 #undef pr_fmt
 #define pr_fmt(fmt) "%s: EGRESS: " fmt, __func__
@@ -338,8 +354,12 @@ static struct sk_buff *iptfs_alloc_skb(struct sk_buff *tpl, uint len)
 	if (!skb)
 		return NULL;
 	skb_reserve(skb, resv);
-	skb->csum = 0;
 	skb_copy_header(skb, tpl);
+
+	// Let's not copy the checksum!
+	skb->csum = 0;
+	skb->ip_summed = CHECKSUM_NONE;
+
 	// the skb_copy_header does the following so figure out wth it is :)
 	// skb_shinfo(new)->gso_size = skb_shinfo(old)->gso_size;
 	// skb_shinfo(new)->gso_segs = skb_shinfo(old)->gso_segs;
@@ -374,8 +394,6 @@ static struct sk_buff *iptfs_pskb_extract_seq(uint skblen, uint resv,
 					      uint off, int len)
 {
 	struct sk_buff *skb = iptfs_alloc_skb(st->root_skb, skblen);
-	// XXX chopps: what is this _exactly_?
-	// skb->ip_summed = 0;
 	if (skb_copy_bits_seq(st, off, skb_put(skb, len), len)) {
 		kfree_skb(skb);
 		return NULL;
@@ -545,7 +563,7 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 		 * We are reassembling but this is an old sequence number.
 		 */
 		XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_OLD_SEQ);
-		pr_devinf("older seq %llu expecting %llu\n", seq,
+		pr_devinf("newer seq %llu expecting %llu\n", seq,
 			  xtfs->ra_wantseq);
 		/* will end parsing */
 		return data + remaining;
@@ -695,6 +713,8 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 	/* will continue on to new data block or end */
 	return data + fraglen;
 }
+
+/* checkout skb_segment to see if it has much of iptfs_input_ordered in it. */
 
 /*
  * We have an IPTFS payload dispense with it and this skb as well.
@@ -886,6 +906,9 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 				 * Reuse fist skb. Need to move past the initial
 				 * iptfs header as well as any initial fragment
 				 * for previous inner packet reassembly
+				 *
+				 * XXX talk about how this is re-using tailroom
+				 * for future fragment copyin
 				 */
 				tmp = skb->data;
 				pskb_pull(skb, data);
@@ -1010,7 +1033,7 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 	list_for_each_entry_safe (skb, next, &sublist, list) {
 		skb_list_del_init(skb);
 		pr_devinf(
-			"sending inner packet len %u skb %p proto %u seq %u\n",
+			"sending inner packet len %u skb %p proto %u seq/port %u\n",
 			(uint)skb->len, skb, _proto(skb), _seq(skb));
 		gro_cells_receive(gro_cells, skb);
 	}
@@ -1162,7 +1185,9 @@ static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 	uint savedlen = xtfs->w_savedlen;
 	u64 wantseq = xtfs->w_wantseq;
 	struct sk_buff *slot0 = NULL;
+#ifdef PR_DEBUG_EGRESS
 	u64 start_drop_seq = xtfs->w_wantseq;
+#endif
 	u64 last_drop_seq = xtfs->w_wantseq;
 	u64 distance, extra_drops, missed, s0seq;
 	uint count = 0;
@@ -1420,9 +1445,9 @@ int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 	return 0;
 }
 
-/* --------------------------------- */
+/* ================================= */
 /* IPTFS Sending (ingress) Functions */
-/* --------------------------------- */
+/* ================================= */
 
 #undef pr_fmt
 #define pr_fmt(fmt) "%s: INGRESS: " fmt, __func__
@@ -1432,6 +1457,35 @@ int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 #else
 #define pr_devinf(...)
 #endif
+
+#if 0
+static inline uint _udpsum(struct sk_buff *skb, uint *port)
+{
+	struct udphdr *u = (struct udphdr *)((struct iphdr *)skb->data + 1);
+	if (_proto(skb) != IPPROTO_UDP)
+		return 0;
+	*port = ntohs(u->dest);
+	return ntohs(u->check);
+}
+
+static void _debug_udp(struct sk_buff *skb)
+{
+	uint cksum, port;
+	cksum = _udpsum(skb, &port);
+	pr_devinf("received udp cxsum: %04x port %d/0x%x skb->data_len %u\n",
+		  cksum, port, port, skb->data_len);
+	pr_devinf(
+		"received udp skb ip_summed == %u, skb->csum 0x%x level %u start %u offset %u valid %u notinet %u comp_sw %u remsumoff %u encap_hdr %u\n",
+		skb->ip_summed, skb->csum, skb->csum_level, skb->csum_start,
+		skb->csum_offset, skb->csum_valid, skb->csum_not_inet,
+		skb->csum_complete_sw, skb->remcsum_offload,
+		skb->encap_hdr_csum);
+}
+#endif
+
+/* ------------------------- */
+/* Enqueue to send functions */
+/* ------------------------- */
 
 /*
  * Check to see if it's OK to queue a packet for sending on tunnel.
@@ -1455,6 +1509,7 @@ static bool iptfs_enqueue(struct xfrm_iptfs_data *xtfs, struct sk_buff *skb)
 /*
  * IPv4/IPv6 packet ingress to IPTFS tunnel, arrange to send in IPTFS payload
  * (i.e., aggregating or fragmenting as appropriate).
+ * This is set in dst->output for an SA.
  */
 int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 			      struct sk_buff *skb)
@@ -1465,6 +1520,7 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 	struct sk_buff *segs, *nskb;
 	uint count, qcount;
 	bool ok = true;
+	bool was_gso;
 
 	/*
 	 * We have hooked into dst_entry->output which means we have skipped the
@@ -1493,14 +1549,15 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 	 * accounting and queuing to be based on the individual packets not on the
 	 * aggregate GSO buffer.
 	 */
-	if (!skb_is_gso(skb)) {
+	was_gso = skb_is_gso(skb);
+	if (!was_gso) {
 		segs = skb;
 		BUG_ON(skb->next);
 	} else {
 		netdev_features_t features = netif_skb_features(skb);
 
 		pr_info_once("received GSO skb (only printing once)\n");
-		pr_devinf("splitting up gso skb %p", skb);
+		pr_devinf("splitting up GSO skb %p", skb);
 
 		segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
 		if (IS_ERR_OR_NULL(segs)) {
@@ -1540,14 +1597,16 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 		// if (skb->protocol == htons(ETH_P_IPV6))
 		// mtu = ip6_skb_dst_mtu(skb);
 		pr_devinf(
-			"skb: %p len %u data_len %u proto %u seq %u dst_mtu() => %d\n",
+			"skb: %p len %u data_len %u proto %u seq %u dst_mtu(skb) %d\n",
 			skb, (uint)skb->len, skb->data_len, _proto(skb),
 			_seq(skb), (int)dst_mtu(dst));
 	}
 
-	if (count)
-		pr_devinf("unpacked %u and queued %u from GSO skb\n", count,
-			  qcount);
+	if (was_gso)
+		pr_devinf("queued %u of %u from gso skb\n", qcount, count);
+	else if (count)
+		pr_devinf("%s received non-gso skb\n",
+			  qcount ? "queued" : "dropped");
 
 	if (!ok) {
 		/* Sanity check, if queue was full time should be set */
@@ -1562,18 +1621,59 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 		BUG_ON(!in_interrupt());
 		hrtimer_start(&xtfs->iptfs_timer, xtfs->init_delay_ns,
 			      IPTFS_HRTIMER_MODE);
+
+		xtfs->iptfs_settime = ktime_get_raw_fast_ns();
+		pr_devinf("settime <- %llu\n", xtfs->iptfs_settime);
 	}
 
-	xtfs->iptfs_settime = ktime_get_raw_fast_ns();
 	spin_unlock_bh(&x->lock);
 	return 0;
 }
 
-static int iptfs_first_skb(struct sk_buff *skb, bool df)
+/* -------------------------- */
+/* Dequeue and send functions */
+/* -------------------------- */
+
+static int iptfs_xfrm_output(struct sk_buff *skb, uint remaining)
+{
+	int err;
+
+	pr_devinf("output skb %p, total len %u remaining space %u\n", skb,
+		  skb->len, remaining);
+	err = xfrm_output(NULL, skb);
+	if (err < 0)
+		printk("XXX got xfrm_output error: %d", err);
+	return err;
+}
+
+static void iptfs_output_prepare_skb(struct sk_buff *skb, uint blkoff)
 {
 	struct ip_iptfs_hdr *h;
 	size_t hsz = sizeof(*h);
-	int mtu = dst_mtu(skb_dst(skb));
+
+	/* now reset values to be pointing at the rest of the packets */
+	h = skb_push(skb, hsz);
+	memset(h, 0, hsz);
+	if (blkoff)
+		h->block_offset = htons(blkoff);
+
+	/*
+	 * network_header current points at the inner IP packet
+	 * move it to the iptfs header
+	 */
+	skb->transport_header = skb->network_header;
+	skb->network_header -= hsz;
+
+	IPCB(skb)->flags |= IPSKB_XFRM_TUNNEL_SIZE;
+	skb->protocol = htons(ETH_P_IP);
+}
+
+static int iptfs_first_skb(struct sk_buff **skbp, bool df, uint mtu,
+			   uint blkoff)
+{
+	struct sk_buff *skb = *skbp;
+	struct sk_buff *nskb;
+	int err;
 
 	/*
 	 * Classic ESP skips the don't fragment ICMP error if DF is clear on
@@ -1586,12 +1686,20 @@ static int iptfs_first_skb(struct sk_buff *skb, bool df)
 	 * normal.
 	 */
 
-	if (df) {
-		/* We'be split these up before queuing */
-		BUG_ON(skb_is_gso(skb));
+	/* The opportunity for HW offload has ended */
+	if (skb->ip_summed == CHECKSUM_PARTIAL) {
+		BUG_ON(blkoff);
+		err = skb_checksum_help(skb);
+		if (err)
+			return err;
+	}
 
-		/* mtu includes all the overhead including the basic header size */
-		if (skb->len > mtu) {
+	/* We've split these up before queuing */
+	BUG_ON(skb_is_gso(skb));
+
+	/* mtu accounted for all the overhead including the basic header size */
+	if (skb->len > mtu) {
+		if (df) {
 			/* pop the iptfs header back off */
 			pr_devinf(
 				"skb: DF too big len %u mtu %d proto %u seq %u\n",
@@ -1606,33 +1714,95 @@ static int iptfs_first_skb(struct sk_buff *skb, bool df)
 					  ICMP_FRAG_NEEDED, htonl(mtu));
 			return -EMSGSIZE;
 		}
-	} else {
+
 		pr_devinf(
-			"skb: iptfs-df-not-set len %u mtu %d proto %u seq %u\n",
-			(uint)skb->len, mtu, _proto(skb), _seq(skb));
+			"skb: iptfs-df-not-set len %u mtu %d blkoff %u proto %u seq %u\n",
+			(uint)skb->len, mtu, blkoff, _proto(skb), _seq(skb));
+
+		/* A user packet has come in on from an interface with larger
+		 * MTU than the IPTFS tunnel pktsize -- we need to fragment.
+		 *
+		 * orig ====> orig       clone      clone
+		 * skb         skb        1          2
+		 *+--+ head   +--+ head  +--+ head  +--+ head
+		 *|  |	      |  |	 |  |	    |  |
+		 *+--+ data   +--+ data  |  |       |  |        ---
+		 *|x |	      |x |	 |  |       |  |         |
+		 *|x |	      |x |	 |  |       |  |        mtu
+		 *|x |        |x |	 |  |       |  |         |
+		 *|x | ====>  +--+ tail  +--+ data  |  |        ---
+		 *|x |        |  |	 |x |       |  |         |
+		 *|x |	      |  |	 |x |       |  |        mtu
+		 *|x |	      |  |	 |x |       |  |         |
+		 *|x |	      |  |	 +--+ tail  +--+ data   ---
+		 *|x |	      |  |	 |  |	    |x |         | fraglen
+		 *+--+ tail   |  |       |  |	    +--+ tail   ---
+		 *|  |	      |  |	 |  |	    |  |
+		 *+--+ end    +--+ end   +--+ end    +--+ end
+		 *
+		 * We need a linear buffer for the above. Do some performance
+		 * testing, if this is a problem try really complex page sharing
+		 * thing if we have to. This is not a common code path, though.
+		 */
+		if (skb_is_nonlinear(skb)) {
+			pr_info_once("LINEARIZE: skb len %u\n", skb->len);
+			err = __skb_linearize(skb);
+			if (err)
+				return err;
+		}
+
+		/* loop creating skb clones of the data until we have enough *iptfs packets */
+		while (skb->len > mtu) {
+			nskb = skb_clone(skb, GFP_ATOMIC);
+			if (!nskb)
+				return -ENOMEM;
+
+			/* this skb set to mtu len, next pull down mtu len */
+			__skb_set_length(skb, mtu);
+			__skb_pull(nskb, mtu);
+
+			/* output the full iptfs packet in skb */
+			iptfs_output_prepare_skb(skb, blkoff);
+			iptfs_xfrm_output(skb, 0);
+
+			/* nskb->len is the remaining amount until next packet */
+			blkoff = nskb->len;
+
+			*skbp = skb = nskb;
+		}
 	}
 
-	h = skb_push(skb, hsz);
-	memset(h, 0, hsz);
-
-	/*
-	 * network_header current points at the inner IP packet
-	 * move it to the iptfs header
-	 */
-	skb->transport_header = skb->network_header;
-	skb->network_header -= hsz;
-
-	IPCB(skb)->flags |= IPSKB_XFRM_TUNNEL_SIZE;
-	skb->protocol = htons(ETH_P_IP);
+	iptfs_output_prepare_skb(skb, blkoff);
 
 	return 0;
 }
 
+/*
+ * Return if we should fragment skb using `remaining` octets.
+ * For now we just say yes; however, we can do smarter things here. For example,
+ * see that out output queue is not growing over time then we could wait to send
+ * this skb in it's own packet avoiding fragmentation.
+ *
+ * TODO: add a short history of queue sizes when we unload the queue and use
+ * this to determine if we should fragment.
+ *
+ * We also do not try and fragment non-linerar skbs or create tiny fragments
+ * heads less than enough to container IP/IPv6 packet length field.
+ */
+bool iptfs_should_fragment(struct sk_buff *skb, uint mtu, uint remaining)
+{
+	if (skb_is_nonlinear(skb))
+		return false;
+	return remaining >= 6; // true;
+}
+
 static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 {
-	bool df = ((struct xfrm_iptfs_data *)x->tfs_data)->cfg.dont_frag;
-	struct sk_buff *skb, *skb2, **nextp;
-	int err;
+	struct xfrm_iptfs_data *xtfs = x->tfs_data;
+	uint payload_mtu = xtfs->payload_mtu;
+	bool df = xtfs->cfg.dont_frag;
+	struct sk_buff *skb, *skb2, *nskb, **nextp;
+	uint blkoff;
 
 	/*
 	 * When we do timed output things (locking) will be more complex in the
@@ -1706,16 +1876,27 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 	 *
 	 */
 
+	/* blkoff is the offset to the start of the next packet if a fragment
+	 * is at the start
+	 */
+	blkoff = 0;
+
 	/* and send them on their way */
 
 	while ((skb = __skb_dequeue(list))) {
-		int remaining = dst_mtu(skb_dst(skb));
+		uint mtu = dst_mtu(skb_dst(skb));
+		int remaining;
+
+		if (payload_mtu && payload_mtu < mtu)
+			mtu = payload_mtu;
+		remaining = mtu;
 
 		pr_devinf(
-			"1st dequeue skb %p len %u data_len %u proto %u seq %u\n",
-			skb, skb->len, skb->data_len, _proto(skb), _seq(skb));
+			"1st dequeue skb %p len %u data_len %u proto %u seq %u blkoff %u\n",
+			skb, skb->len, skb->data_len, _proto(skb), _seq(skb),
+			blkoff);
 
-		if (iptfs_first_skb(skb, df)) {
+		if (iptfs_first_skb(&skb, df, mtu, blkoff)) {
 			kfree_skb(skb);
 			continue;
 		}
@@ -1726,13 +1907,29 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 		 */
 		remaining -= (skb->len - sizeof(struct ip_iptfs_hdr));
 
+		/*
+		 * we are starting over now, no fragmentation yet.
+		 */
+		blkoff = 0;
+
 		nextp = &skb_shinfo(skb)->frag_list;
 		while (*nextp)
 			nextp = &(skb_shinfo(*nextp))->frag_list;
 
-		/* XXX should peek first to see if we have MTU room to append */
+		/* See if we have enough space to simply append */
 		while ((skb2 = skb_peek(list)) && skb2->len <= remaining) {
 			skb2 = __skb_dequeue(list);
+
+			/* The opportunity for HW offload has ended */
+			if (skb2->ip_summed == CHECKSUM_PARTIAL) {
+				if (skb_checksum_help(skb2)) {
+					XFRM_INC_STATS(
+						dev_net(skb_dst(skb2)->dev),
+						LINUX_MIB_XFRMINERROR);
+					kfree_skb(skb2);
+					continue;
+				}
+			}
 
 			pr_devinf(
 				"append secondary dequeue skb2 %p len %u data_len %u proto %u seq %u\n",
@@ -1771,12 +1968,57 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 			remaining -= skb2->len;
 		}
 
-		pr_devinf("output skb %p, total len %u remaining space %u\n",
-			  skb, skb->len, remaining);
-		err = xfrm_output(NULL, skb);
-		if (err < 0) {
-			printk("XXX got xfrm_output error: %d", err);
+		if (!df && skb2 &&
+		    iptfs_should_fragment(skb2, mtu, remaining)) {
+			BUG_ON(skb_is_nonlinear(skb2));
+
+			/* The opportunity for HW offload has ended */
+			if (skb2->ip_summed == CHECKSUM_PARTIAL) {
+				if (skb_checksum_help(skb2)) {
+					BUG_ON(skb2 != __skb_dequeue(list));
+					XFRM_INC_STATS(
+						dev_net(skb_dst(skb2)->dev),
+						LINUX_MIB_XFRMINERROR);
+					kfree_skb(skb2);
+					goto sendit;
+				}
+			}
+
+			nskb = skb_clone(skb2, GFP_ATOMIC);
+			if (!nskb)
+				goto sendit;
+
+			/* Set new skb to remaining avail len, pull down
+			 * remainning from on queue skb. Keen sighted obvservers
+			 * will notice this is reversed from iptfs_first_skb,
+			 * that is so we can leave skb2 queued (the latter part
+			 * of the pkt) and attach the front part (nskb) to the
+			 * current pkt (skb).
+			 */
+			__skb_set_length(nskb, remaining);
+			__skb_pull(skb2, remaining);
+			blkoff = skb2->len;
+
+			pr_devinf(
+				"append cloned first fragment len %u data_len %u proto %u seq %u\n"
+				"leaving original/remaining skb on queue len %u data_len %u\n",
+				nskb->len, nskb->data_len, _proto(nskb),
+				_seq(nskb), skb2->len, skb2->data_len);
+
+			*nextp = nskb;
+			nextp = &nskb->next;
+			BUG_ON(*nextp != NULL);
+			skb->data_len += nskb->len;
+			skb->len += nskb->len;
+
+			/* this hasn't changed right? */
+			skb->truesize += nskb->truesize;
+
+			remaining -= nskb->len;
+			BUG_ON(remaining != 0);
 		}
+	sendit:
+		iptfs_xfrm_output(skb, remaining);
 	}
 }
 
