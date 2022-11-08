@@ -1730,12 +1730,13 @@ static int iptfs_first_skb(struct sk_buff **skbp, bool df, uint mtu,
  * TODO: add a short history of queue sizes when we unload the queue and use
  * this to determine if we should fragment.
  *
- * We also do not try and fragment non-linerar skb's or skb's that are larger
- * than our available IPTFS MTU.
+ * TEMP: Convert for now (-We-also-do-not-try-and-fragment-non-linerar-skbs)
  */
 bool iptfs_should_fragment(struct sk_buff *skb, uint mtu, uint remaining)
 {
-	return !skb_is_nonlinear(skb) || skb->len > mtu;
+	if (skb_is_nonlinear(skb))
+		return skb_linearize(skb) == 0;
+	return true;
 }
 
 static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
