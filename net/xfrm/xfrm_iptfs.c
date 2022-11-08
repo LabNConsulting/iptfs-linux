@@ -1826,8 +1826,12 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 	/* and send them on their way */
 
 	while ((skb = __skb_dequeue(list))) {
-		uint mtu = min(payload_mtu, dst_mtu(skb_dst(skb)));
-		int remaining = mtu;
+		uint mtu = dst_mtu(skb_dst(skb));
+		int remaining;
+
+		if (payload_mtu && payload_mtu < mtu)
+			mtu = payload_mtu;
+		remaining = mtu;
 
 		pr_devinf(
 			"1st dequeue skb %p len %u data_len %u proto %u seq %u\n",
@@ -1853,7 +1857,7 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 		while (*nextp)
 			nextp = &(skb_shinfo(*nextp))->frag_list;
 
-		/* XXX should peek first to see if we have MTU room to append */
+		/* See if we have enough space to simply append */
 		while ((skb2 = skb_peek(list)) && skb2->len <= remaining) {
 			skb2 = __skb_dequeue(list);
 
@@ -1910,6 +1914,12 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 			__skb_set_length(nskb, remaining);
 			__skb_pull(skb2, remaining);
 			blkoff = skb2->len;
+
+			pr_devinf(
+				"append cloned first fragment len %u data_len %u proto %u seq %u\n"
+				"leaving original/remaining skb on queue len %u data_len %u\n",
+				nskb->len, nskb->data_len, _proto(nskb),
+				_seq(nskb), skb2->len, skb2->data_len);
 
 			*nextp = nskb;
 			nextp = &nskb->next;
