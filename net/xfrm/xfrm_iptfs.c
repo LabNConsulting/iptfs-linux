@@ -1919,7 +1919,8 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 			remaining -= skb2->len;
 		}
 
-		if (skb2 && iptfs_should_fragment(skb2, mtu, remaining)) {
+		if (!df && skb2 &&
+		    iptfs_should_fragment(skb2, mtu, remaining)) {
 			BUG_ON(skb_is_nonlinear(skb2));
 			nskb = skb_clone(skb2, GFP_ATOMIC);
 			if (!nskb)
