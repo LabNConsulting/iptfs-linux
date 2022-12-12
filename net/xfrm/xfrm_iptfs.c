@@ -99,6 +99,15 @@ static inline uint _proto(struct sk_buff *skb)
 	return ((struct iphdr *)skb->data)->protocol;
 }
 
+static inline uint _udpsum(struct sk_buff *skb, uint *port)
+{
+	struct udphdr *u = (struct udphdr *)((struct iphdr *)skb->data + 1);
+	if (_proto(skb) != IPPROTO_UDP)
+		return 0;
+	*port = ntohs(u->dest);
+	return ntohs(u->check);
+}
+
 static inline uint _seq(struct sk_buff *skb)
 {
 	uint protocol = _proto(skb);
@@ -354,8 +363,12 @@ static struct sk_buff *iptfs_alloc_skb(struct sk_buff *tpl, uint len)
 	if (!skb)
 		return NULL;
 	skb_reserve(skb, resv);
-	skb->csum = 0;
 	skb_copy_header(skb, tpl);
+
+	// Let's not copy the checksum!
+	skb->csum = 0;
+	skb->ip_summed = CHECKSUM_NONE;
+
 	// the skb_copy_header does the following so figure out wth it is :)
 	// skb_shinfo(new)->gso_size = skb_shinfo(old)->gso_size;
 	// skb_shinfo(new)->gso_segs = skb_shinfo(old)->gso_segs;
@@ -390,8 +403,6 @@ static struct sk_buff *iptfs_pskb_extract_seq(uint skblen, uint resv,
 					      uint off, int len)
 {
 	struct sk_buff *skb = iptfs_alloc_skb(st->root_skb, skblen);
-	// XXX chopps: what is this _exactly_?
-	// skb->ip_summed = 0;
 	if (skb_copy_bits_seq(st, off, skb_put(skb, len), len)) {
 		kfree_skb(skb);
 		return NULL;
@@ -1029,10 +1040,20 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 
 	/* Send the packets! */
 	list_for_each_entry_safe (skb, next, &sublist, list) {
+		uint cksum, port;
 		skb_list_del_init(skb);
 		pr_devinf(
 			"sending inner packet len %u skb %p proto %u seq/port %u\n",
 			(uint)skb->len, skb, _proto(skb), _seq(skb));
+
+		cksum = _udpsum(skb, &port);
+		pr_devinf("sending udp cxsum: %04x port %d\n", cksum, port);
+		pr_devinf(
+			"sending udp skb ip_summed == %u, skb->csum 0x%x level %u start %u offset %u valid %u notinet %u comp_sw %u remsumoff %u encap_hdr %u\n",
+			skb->ip_summed, skb->csum, skb->csum_level,
+			skb->csum_start, skb->csum_offset, skb->csum_valid,
+			skb->csum_not_inet, skb->csum_complete_sw,
+			skb->remcsum_offload, skb->encap_hdr_csum);
 		gro_cells_receive(gro_cells, skb);
 	}
 
@@ -1883,7 +1904,7 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 			nextp = &(skb_shinfo(*nextp))->frag_list;
 
 		/* See if we have enough space to simply append */
-		maxagg = 10;
+		maxagg = 2;
 		while ((skb2 = skb_peek(list)) && maxagg-- > 0 &&
 		       skb2->len <= remaining) {
 			skb2 = __skb_dequeue(list);
