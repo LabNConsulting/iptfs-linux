@@ -90,9 +90,9 @@ struct xfrm_iptfs_data {
 static enum hrtimer_restart iptfs_delay_timer(struct hrtimer *me);
 static enum hrtimer_restart iptfs_drop_timer(struct hrtimer *me);
 
-/* ----------------- */
+/* ================= */
 /* Utility Functions */
-/* ----------------- */
+/* ================= */
 
 static inline uint _proto(struct sk_buff *skb)
 {
@@ -109,6 +109,9 @@ static inline uint _seq(struct sk_buff *skb)
 	else if (protocol == IPPROTO_TCP)
 		return ntohl(
 			((struct tcphdr *)((struct iphdr *)skb->data + 1))->seq);
+	else if (protocol == IPPROTO_UDP)
+		return ntohs(((struct udphdr *)((struct iphdr *)skb->data + 1))
+				     ->source);
 	else
 		return 0;
 }
@@ -138,9 +141,9 @@ void xfrm_iptfs_get_rtt_and_delays(struct ip_iptfs_cc_hdr *cch, u32 *rtt,
 		      cch->adelay2_and_xdelay[3];
 }
 
-/* -------------------------- */
+/* ========================== */
 /* State Management Functions */
-/* -------------------------- */
+/* ========================== */
 
 #undef pr_fmt
 #define pr_fmt(fmt) "%s: STATE: " fmt, __func__
@@ -262,9 +265,9 @@ int xfrm_iptfs_copy_to_user_state(struct xfrm_state *x, struct sk_buff *skb)
 	return ret;
 }
 
-/* ---------------------------------- */
+/* ================================== */
 /* IPTFS Receiving (egress) Functions */
-/* ---------------------------------- */
+/* ================================== */
 
 #undef pr_fmt
 #define pr_fmt(fmt) "%s: EGRESS: " fmt, __func__
@@ -1028,7 +1031,7 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 	list_for_each_entry_safe (skb, next, &sublist, list) {
 		skb_list_del_init(skb);
 		pr_devinf(
-			"sending inner packet len %u skb %p proto %u seq %u\n",
+			"sending inner packet len %u skb %p proto %u seq/port %u\n",
 			(uint)skb->len, skb, _proto(skb), _seq(skb));
 		gro_cells_receive(gro_cells, skb);
 	}
@@ -1180,7 +1183,9 @@ static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 	uint savedlen = xtfs->w_savedlen;
 	u64 wantseq = xtfs->w_wantseq;
 	struct sk_buff *slot0 = NULL;
+#ifdef PR_DEBUG_EGRESS
 	u64 start_drop_seq = xtfs->w_wantseq;
+#endif
 	u64 last_drop_seq = xtfs->w_wantseq;
 	u64 distance, extra_drops, missed, s0seq;
 	uint count = 0;
@@ -1438,9 +1443,9 @@ int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 	return 0;
 }
 
-/* --------------------------------- */
+/* ================================= */
 /* IPTFS Sending (ingress) Functions */
-/* --------------------------------- */
+/* ================================= */
 
 #undef pr_fmt
 #define pr_fmt(fmt) "%s: INGRESS: " fmt, __func__
@@ -1450,6 +1455,10 @@ int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 #else
 #define pr_devinf(...)
 #endif
+
+/* ------------------------- */
+/* Enqueue to send functions */
+/* ------------------------- */
 
 /*
  * Check to see if it's OK to queue a packet for sending on tunnel.
@@ -1473,6 +1482,7 @@ static bool iptfs_enqueue(struct xfrm_iptfs_data *xtfs, struct sk_buff *skb)
 /*
  * IPv4/IPv6 packet ingress to IPTFS tunnel, arrange to send in IPTFS payload
  * (i.e., aggregating or fragmenting as appropriate).
+ * This is set in dst->output for an SA.
  */
 int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 			      struct sk_buff *skb)
@@ -1483,6 +1493,7 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 	struct sk_buff *segs, *nskb;
 	uint count, qcount;
 	bool ok = true;
+	bool was_gso;
 
 	/*
 	 * We have hooked into dst_entry->output which means we have skipped the
@@ -1511,14 +1522,15 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 	 * accounting and queuing to be based on the individual packets not on the
 	 * aggregate GSO buffer.
 	 */
-	if (!skb_is_gso(skb)) {
+	was_gso = skb_is_gso(skb);
+	if (!was_gso) {
 		segs = skb;
 		BUG_ON(skb->next);
 	} else {
 		netdev_features_t features = netif_skb_features(skb);
 
 		pr_info_once("received GSO skb (only printing once)\n");
-		pr_devinf("splitting up gso skb %p", skb);
+		pr_devinf("splitting up GSO skb %p", skb);
 
 		segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
 		if (IS_ERR_OR_NULL(segs)) {
@@ -1563,9 +1575,11 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 			_seq(skb), (int)dst_mtu(dst));
 	}
 
-	if (count)
-		pr_devinf("unpacked %u and queued %u from GSO skb\n", count,
-			  qcount);
+	if (was_gso)
+		pr_devinf("queued %u of %u from gso skb\n", qcount, count);
+	else if (count)
+		pr_devinf("%s received non-gso skb\n",
+			  qcount ? "queued" : "dropped");
 
 	if (!ok) {
 		/* Sanity check, if queue was full time should be set */
@@ -1580,12 +1594,18 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 		BUG_ON(!in_interrupt());
 		hrtimer_start(&xtfs->iptfs_timer, xtfs->init_delay_ns,
 			      IPTFS_HRTIMER_MODE);
+
+		xtfs->iptfs_settime = ktime_get_raw_fast_ns();
+		pr_devinf("settime <- %llu\n", xtfs->iptfs_settime);
 	}
 
-	xtfs->iptfs_settime = ktime_get_raw_fast_ns();
 	spin_unlock_bh(&x->lock);
 	return 0;
 }
+
+/* -------------------------- */
+/* Dequeue and send functions */
+/* -------------------------- */
 
 static int iptfs_xfrm_output(struct sk_buff *skb, uint remaining)
 {
@@ -1943,7 +1963,7 @@ static enum hrtimer_restart iptfs_delay_timer(struct hrtimer *me)
 	struct sk_buff_head list;
 	struct xfrm_iptfs_data *xtfs;
 	struct xfrm_state *x;
-	time64_t settime;
+	time64_t settime, now;
 	size_t osize;
 
 	xtfs = container_of(me, typeof(*xtfs), iptfs_timer);
@@ -1980,8 +2000,8 @@ static enum hrtimer_restart iptfs_delay_timer(struct hrtimer *me)
 
 	pr_devinf("got %u packets of %u total len\n", (uint)list.qlen,
 		  (uint)osize);
-	pr_devinf("time delta %llu\n",
-		  (unsigned long long)(ktime_get_raw_fast_ns() - settime));
+	now = ktime_get_raw_fast_ns();
+	pr_devinf("time %llu delta %llu\n", now, (now - settime));
 
 	iptfs_output_queued(x, &list);
 
