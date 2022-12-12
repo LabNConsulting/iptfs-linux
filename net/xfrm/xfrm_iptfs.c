@@ -1710,6 +1710,7 @@ static int iptfs_first_skb(struct sk_buff **skbp, bool df, uint mtu,
 		 * thing if we have to. This is not a common code path, though.
 		 */
 		if (skb_is_nonlinear(skb)) {
+			pr_info_once("LINEARIZE: skb len %u\n", skb->len);
 			err = __skb_linearize(skb);
 			if (err)
 				return err;
@@ -1754,9 +1755,11 @@ static int iptfs_first_skb(struct sk_buff **skbp, bool df, uint mtu,
  */
 bool iptfs_should_fragment(struct sk_buff *skb, uint mtu, uint remaining)
 {
-	if (skb_is_nonlinear(skb))
-		return skb_linearize(skb) == 0;
-	return true;
+	if (skb_is_nonlinear(skb)) {
+		return false;
+		// return skb_linearize(skb) == 0;
+	}
+	return remaining >= 4; // true;
 }
 
 static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
@@ -1849,6 +1852,7 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 	while ((skb = __skb_dequeue(list))) {
 		uint mtu = dst_mtu(skb_dst(skb));
 		int remaining;
+		int maxagg;
 
 		if (payload_mtu && payload_mtu < mtu)
 			mtu = payload_mtu;
@@ -1879,7 +1883,9 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 			nextp = &(skb_shinfo(*nextp))->frag_list;
 
 		/* See if we have enough space to simply append */
-		while ((skb2 = skb_peek(list)) && skb2->len <= remaining) {
+		maxagg = 10;
+		while ((skb2 = skb_peek(list)) && maxagg-- > 0 &&
+		       skb2->len <= remaining) {
 			skb2 = __skb_dequeue(list);
 
 			pr_devinf(
@@ -1954,6 +1960,16 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 			BUG_ON(remaining != 0);
 		}
 
+/* XXX hack to see if this improves the veth performance */
+#if 0
+		if (skb_is_nonlinear(skb)) {
+			if (skb_linearize(skb)) {
+				kfree_skb(skb);
+				printk("DROPPINGXXX\n");
+				continue;
+			}
+		}
+#endif
 	sendit:
 		iptfs_xfrm_output(skb, remaining);
 	}
