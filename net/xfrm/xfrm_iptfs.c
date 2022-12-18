@@ -341,6 +341,23 @@ int skb_copy_bits_seq(struct skb_seq_state *st, int offset, void *to, int len)
 }
 EXPORT_SYMBOL(skb_copy_bits_seq);
 
+static struct sk_buff *iptfs_alloc_header_skb(void)
+{
+	struct sk_buff *skb;
+	uint resv = XFRM_IPTFS_MIN_HEADROOM;
+
+	pr_devinf("resv %u\n", len, resv);
+	skb = alloc_skb(resv, GFP_ATOMIC);
+	if (!skb) {
+		XFRM_INC_STATS(dev_net(skb->dev), LINUX_MIB_XFRMINERROR);
+		pr_err_ratelimited("failed to alloc skb\n");
+		return NULL;
+	}
+	skb_reserve(skb, resv);
+	// skb->ip_summed = CHECKSUM_NONE;
+	return skb;
+}
+
 static struct sk_buff *iptfs_alloc_skb(struct sk_buff *tpl, uint len)
 {
 	struct sk_buff *skb;
@@ -351,8 +368,11 @@ static struct sk_buff *iptfs_alloc_skb(struct sk_buff *tpl, uint len)
 
 	pr_devinf("len %u resv %u\n", len, resv);
 	skb = alloc_skb(len + resv, GFP_ATOMIC);
-	if (!skb)
+	if (!skb) {
+		XFRM_INC_STATS(dev_net(skb->dev), LINUX_MIB_XFRMINERROR);
+		pr_err_ratelimited("failed to alloc skb\n");
 		return NULL;
+	}
 	skb_reserve(skb, resv);
 	skb_copy_header(skb, tpl);
 
@@ -364,11 +384,8 @@ static struct sk_buff *iptfs_alloc_skb(struct sk_buff *tpl, uint len)
 	// skb_shinfo(new)->gso_size = skb_shinfo(old)->gso_size;
 	// skb_shinfo(new)->gso_segs = skb_shinfo(old)->gso_segs;
 	// skb_shinfo(new)->gso_type = skb_shinfo(old)->gso_type;
-	if (!skb_sec_path(skb)) {
-		XFRM_INC_STATS(dev_net(skb->dev), LINUX_MIB_XFRMINERROR);
-		kfree_skb(skb);
-		return NULL;
-	}
+	BUG_ON(!skb_sec_path(skb));
+
 	return skb;
 }
 
@@ -394,7 +411,11 @@ static struct sk_buff *iptfs_pskb_extract_seq(uint skblen, uint resv,
 					      uint off, int len)
 {
 	struct sk_buff *skb = iptfs_alloc_skb(st->root_skb, skblen);
+	if (!skb)
+		return NULL;
 	if (skb_copy_bits_seq(st, off, skb_put(skb, len), len)) {
+		XFRM_INC_STATS(dev_net(st->root_skb->dev),
+			       LINUX_MIB_XFRMINERROR);
 		kfree_skb(skb);
 		return NULL;
 	}
@@ -613,12 +634,8 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 		/* we have enough data to get the ip length value now */
 		ipremain = __iptfs_iplen(xtfs->ra_runt);
 		newskb = iptfs_alloc_skb(skb, ipremain);
-		if (!newskb) {
-			XFRM_INC_STATS(dev_net(skb->dev),
-				       LINUX_MIB_XFRMINERROR);
-			pr_err_ratelimited("can't get new skb");
+		if (!newskb)
 			return data + min(blkoff, remaining);
-		}
 		xtfs->ra_newskb = newskb;
 		/*
 		 * Copy the runt data into the buffer, but leave data
@@ -957,8 +974,6 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 			skb = iptfs_pskb_extract_seq(iplen, resv, &skbseq, data,
 						     capturelen);
 			if (!skb) {
-				pr_err("failed to alloc new skb\n");
-				XFRM_INC_STATS(net, LINUX_MIB_XFRMINERROR);
 				continue;
 			}
 			pr_devinf("alloc'd new skb %p\n", skb);
@@ -1458,31 +1473,6 @@ int xfrm_iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 #define pr_devinf(...)
 #endif
 
-#if 0
-static inline uint _udpsum(struct sk_buff *skb, uint *port)
-{
-	struct udphdr *u = (struct udphdr *)((struct iphdr *)skb->data + 1);
-	if (_proto(skb) != IPPROTO_UDP)
-		return 0;
-	*port = ntohs(u->dest);
-	return ntohs(u->check);
-}
-
-static void _debug_udp(struct sk_buff *skb)
-{
-	uint cksum, port;
-	cksum = _udpsum(skb, &port);
-	pr_devinf("received udp cxsum: %04x port %d/0x%x skb->data_len %u\n",
-		  cksum, port, port, skb->data_len);
-	pr_devinf(
-		"received udp skb ip_summed == %u, skb->csum 0x%x level %u start %u offset %u valid %u notinet %u comp_sw %u remsumoff %u encap_hdr %u\n",
-		skb->ip_summed, skb->csum, skb->csum_level, skb->csum_start,
-		skb->csum_offset, skb->csum_valid, skb->csum_not_inet,
-		skb->csum_complete_sw, skb->remcsum_offload,
-		skb->encap_hdr_csum);
-}
-#endif
-
 /* ------------------------- */
 /* Enqueue to send functions */
 /* ------------------------- */
@@ -1747,15 +1737,23 @@ static int iptfs_first_skb(struct sk_buff **skbp, bool df, uint mtu,
 		if (skb_is_nonlinear(skb)) {
 			pr_info_once("LINEARIZE: skb len %u\n", skb->len);
 			err = __skb_linearize(skb);
-			if (err)
+			if (err) {
+				XFRM_INC_STATS(dev_net(skb->dev),
+					       LINUX_MIB_XFRMOUTERROR);
+				pr_err_ratelimited("skb_linearize failed\n");
 				return err;
+			}
 		}
 
-		/* loop creating skb clones of the data until we have enough *iptfs packets */
+		/* loop creating skb clones of the data until we have enough iptfs packets */
 		while (skb->len > mtu) {
 			nskb = skb_clone(skb, GFP_ATOMIC);
-			if (!nskb)
+			if (!nskb) {
+				XFRM_INC_STATS(dev_net(skb->dev),
+					       LINUX_MIB_XFRMOUTERROR);
+				pr_err_ratelimited("failed to clone skb\n");
 				return -ENOMEM;
+			}
 
 			/* this skb set to mtu len, next pull down mtu len */
 			__skb_set_length(skb, mtu);
@@ -1777,6 +1775,35 @@ static int iptfs_first_skb(struct sk_buff **skbp, bool df, uint mtu,
 	return 0;
 }
 
+static struct sk_buff **iptfs_rehome_fraglist(struct sk_buff **nextp,
+					      struct sk_buff *child)
+{
+	uint fllen = 0;
+
+	BUG_ON(!skb_has_frag_list(child));
+	pr_devinf("2nd skb2 has frag list collapsing\n");
+	/*
+	 * I think it might be possible to account for
+	 * a frag list in addition to page fragment if
+	 * it's a valid state to be in. The page
+	 * fragments size should be kept as data_len
+	 * so only the frag_list size is removed, this
+	 * must be done above as well took
+	 */
+	BUG_ON(skb_shinfo(child)->nr_frags);
+	*nextp = skb_shinfo(child)->frag_list;
+	while (*nextp) {
+		fllen += (*nextp)->len;
+		nextp = &(*nextp)->next;
+	}
+	skb_frag_list_init(child);
+	BUG_ON(fllen > child->data_len);
+	child->len -= fllen;
+	child->data_len -= fllen;
+
+	return nextp;
+}
+
 /*
  * Return if we should fragment skb using `remaining` octets.
  * For now we just say yes; however, we can do smarter things here. For example,
@@ -1789,7 +1816,7 @@ static int iptfs_first_skb(struct sk_buff **skbp, bool df, uint mtu,
  * We also do not try and fragment non-linerar skbs or create tiny fragments
  * heads less than enough to container IP/IPv6 packet length field.
  */
-bool iptfs_should_fragment(struct sk_buff *skb, uint mtu, uint remaining)
+static bool iptfs_should_fragment(struct sk_buff *skb, uint mtu, uint remaining)
 {
 	if (skb_is_nonlinear(skb))
 		return false;
@@ -1913,19 +1940,24 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 		blkoff = 0;
 
 		nextp = &skb_shinfo(skb)->frag_list;
-		while (*nextp)
-			nextp = &(skb_shinfo(*nextp))->frag_list;
+		while (*nextp) {
+			if (skb_has_frag_list(*nextp))
+				nextp = iptfs_rehome_fraglist(&(*nextp)->next,
+							      *nextp);
+			else
+				nextp = &(*nextp)->next;
+		}
 
 		/* See if we have enough space to simply append */
 		while ((skb2 = skb_peek(list)) && skb2->len <= remaining) {
-			skb2 = __skb_dequeue(list);
+			__skb_unlink(skb2, list);
 
 			/* The opportunity for HW offload has ended */
 			if (skb2->ip_summed == CHECKSUM_PARTIAL) {
 				if (skb_checksum_help(skb2)) {
 					XFRM_INC_STATS(
 						dev_net(skb_dst(skb2)->dev),
-						LINUX_MIB_XFRMINERROR);
+						LINUX_MIB_XFRMOUTERROR);
 					kfree_skb(skb2);
 					continue;
 				}
@@ -1935,6 +1967,7 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 				"append secondary dequeue skb2 %p len %u data_len %u proto %u seq %u\n",
 				skb2, skb2->len, skb2->data_len, _proto(skb2),
 				_seq(skb2));
+
 			// skb_shinfo(skb)->frag_list = skb2;
 			*nextp = skb2;
 			nextp = &skb2->next;
@@ -1946,30 +1979,21 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
                          * if we have fragments on skb2 we need to switch
                          * them to skb's list
                          */
-			if (skb_has_frag_list(skb2)) {
-				pr_devinf(
-					"2nd skb2 has frag list collapsing\n");
-				/*
-                                 * I think it might be possible to account for
-                                 * a frag list in addition to page fragment if
-                                 * it's a valid state to be in. The page
-                                 * fragments size should be kept as data_len
-                                 * so only the frag_list size is removed, this
-                                 * must be done above as well took
-                                 */
-				BUG_ON(skb_shinfo(skb2)->nr_frags);
-				*nextp = skb_shinfo(skb2)->frag_list;
-				while (*nextp)
-					nextp = &(*nextp)->next;
-				skb_frag_list_init(skb2);
-				skb2->len -= skb2->data_len;
-				skb2->data_len = 0;
-			}
+			if (skb_has_frag_list(skb2))
+				nextp = iptfs_rehome_fraglist(nextp, skb2);
+
 			remaining -= skb2->len;
 		}
 
-		if (!df && skb2 &&
+		/*
+		 * Check to see if we had a packet that didn't fit that we could
+		 * fragment into the current iptfs skb.
+		 */
+		if (!df && skb2 && !skb_has_frag_list(skb2) &&
 		    iptfs_should_fragment(skb2, mtu, remaining)) {
+			struct sk_buff *head_skb;
+
+			/* XXX remove this when we start sharing page frags */
 			BUG_ON(skb_is_nonlinear(skb2));
 
 			/* The opportunity for HW offload has ended */
@@ -1978,44 +2002,75 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 					BUG_ON(skb2 != __skb_dequeue(list));
 					XFRM_INC_STATS(
 						dev_net(skb_dst(skb2)->dev),
-						LINUX_MIB_XFRMINERROR);
+						LINUX_MIB_XFRMOUTERROR);
 					kfree_skb(skb2);
 					goto sendit;
 				}
 			}
 
-			nskb = skb_clone(skb2, GFP_ATOMIC);
-			if (!nskb)
+			head_skb = iptfs_alloc_header_skb();
+			if (!head_skb)
 				goto sendit;
 
-			/* Set new skb to remaining avail len, pull down
-			 * remainning from on queue skb. Keen sighted obvservers
-			 * will notice this is reversed from iptfs_first_skb,
-			 * that is so we can leave skb2 queued (the latter part
-			 * of the pkt) and attach the front part (nskb) to the
-			 * current pkt (skb).
-			 */
-			__skb_set_length(nskb, remaining);
-			__skb_pull(skb2, remaining);
-			blkoff = skb2->len;
+			nskb = skb_clone(skb2, GFP_ATOMIC);
+			if (!nskb) {
+				consume_skb(head_skb);
+				XFRM_INC_STATS(dev_net(skb->dev),
+					       LINUX_MIB_XFRMOUTERROR);
+				pr_err_ratelimited("failed to clone skb\n");
+				goto sendit;
+			}
+
+			/* Dequeue now that there's no chance of error */
+			__skb_unlink(skb2, list);
+
+			/* copy a couple selected items from skb2 into new head skb */
+			head_skb->tstamp = skb2->tstamp;
+			head_skb->dev = skb2->dev;
+			memcpy(head_skb->cb, skb2->cb, sizeof(skb2->cb));
+			skb_dst_copy(head_skb, skb2);
+			__skb_ext_copy(head_skb, skb2);
+			__nf_copy(head_skb, skb2, false);
 
 			pr_devinf(
-				"append cloned first fragment len %u data_len %u proto %u seq %u\n"
-				"leaving original/remaining skb on queue len %u data_len %u\n",
-				nskb->len, nskb->data_len, _proto(nskb),
-				_seq(nskb), skb2->len, skb2->data_len);
+				"appending skb as fragment: skb2->len %u skb2->data_len %u\n",
+				skb2->len, skb2->data_len);
 
-			*nextp = nskb;
-			nextp = &nskb->next;
+			/* Set skb2 to remaining avail len, pull down remainning
+			 * from the clone nskb.
+			 */
+			__skb_set_length(skb2, remaining);
+			__skb_pull(nskb, remaining);
+
+			/* put leftovers into blank head skb */
+			skb_shinfo(head_skb)->frag_list = nskb;
+			head_skb->len += nskb->len;
+			head_skb->data_len += nskb->len;
+			head_skb->truesize += nskb->truesize;
+			blkoff = head_skb->len;
+
+			pr_devinf(
+				"append fragment len %u data_len %u proto %u seq %u\n"
+				"new head and leftover on queue with remaining len %u data_len %u\n",
+				skb2->len, skb2->data_len, _proto(skb2),
+				_seq(skb2), head_skb->len, head_skb->data_len);
+
+			/* link skb2 into current packet */
+			*nextp = skb2;
+			nextp = &skb2->next;
 			BUG_ON(*nextp != NULL);
-			skb->data_len += nskb->len;
-			skb->len += nskb->len;
+			skb->data_len += skb2->len;
+			skb->len += skb2->len;
+			skb->truesize += skb2->truesize;
 
-			/* this hasn't changed right? */
-			skb->truesize += nskb->truesize;
+			if (skb_has_frag_list(skb2))
+				nextp = iptfs_rehome_fraglist(nextp, skb2);
 
-			remaining -= nskb->len;
+			remaining -= skb2->len;
 			BUG_ON(remaining != 0);
+
+			/* put the new head skb back on the top of the queue */
+			__skb_queue_head(list, head_skb);
 		}
 	sendit:
 		iptfs_xfrm_output(skb, remaining);
