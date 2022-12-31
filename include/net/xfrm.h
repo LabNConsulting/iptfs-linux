@@ -2192,6 +2192,7 @@ static inline int register_xfrm_interface_bpf(void)
 #endif
 
 #if IS_ENABLED(CONFIG_XFRM_IPTFS)
+extern struct gro_cells *xfrm_input_gro_cells;
 #define XFRM_IPTFS_DEFAULT_MAX_QUEUE_SIZE (1024 * 1024)
 #define XFRM_IPTFS_DEFAULT_INIT_DELAY_USECS (0)
 #define XFRM_IPTFS_DEFAULT_DROP_TIME_USECS (1000000)

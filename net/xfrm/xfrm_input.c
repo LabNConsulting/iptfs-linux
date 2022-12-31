@@ -48,6 +48,7 @@ static struct xfrm_input_afinfo const __rcu *xfrm_input_afinfo[2][AF_INET6 + 1];
 
 static struct gro_cells gro_cells;
 static struct net_device xfrm_napi_dev;
+struct gro_cells *xfrm_input_gro_cells = &gro_cells;
 
 static DEFINE_PER_CPU(struct xfrm_trans_tasklet, xfrm_trans_tasklet);
 
