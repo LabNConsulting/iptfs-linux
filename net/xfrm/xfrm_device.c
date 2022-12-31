@@ -94,6 +94,10 @@ static void xfrm_outer_mode_prep(struct xfrm_state *x, struct sk_buff *skb)
 	case XFRM_MODE_ROUTEOPTIMIZATION:
 	case XFRM_MODE_IN_TRIGGER:
 		break;
+	default:
+		if (x->mode_cbs && x->mode_cbs->xmit_prep)
+			return x->mode_cbs->xmit_prep(x, skb);
+		break;
 	}
 }
 

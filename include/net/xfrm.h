@@ -289,6 +289,9 @@ struct xfrm_state {
 	/* Private data of this transformer, format is opaque,
 	 * interpreted by xfrm_type methods. */
 	void			*data;
+
+	const struct xfrm_mode_cbs	*mode_cbs;
+	void				*mode_data;
 };
 
 static inline struct net *xs_net(struct xfrm_state *x)
@@ -440,6 +443,23 @@ struct xfrm_type_offload {
 
 int xfrm_register_type_offload(const struct xfrm_type_offload *type, unsigned short family);
 void xfrm_unregister_type_offload(const struct xfrm_type_offload *type, unsigned short family);
+
+struct xfrm_mode_cbs {
+	struct module	*owner;
+	int		(*create_state)(struct xfrm_state *x);
+	void		(*delete_state)(struct xfrm_state *x);
+	int		(*user_init)(struct net *net, struct xfrm_state *x,
+				     struct nlattr **attrs);
+	int		(*copy_to_user)(struct xfrm_state *x, struct sk_buff *skb);
+	void		(*input)(struct xfrm_state *x, struct sk_buff *skb);
+
+	void		(*xmit_prep)(struct xfrm_state *x, struct sk_buff *skb);
+	int		(*output)(struct net *net, struct sock *sk, struct sk_buff *skb);
+};
+
+int xfrm_register_mode_cbs(const struct xfrm_mode_cbs *mode_cbs);
+void xfrm_unregister_mode_cbs(const struct xfrm_mode_cbs *mode_cbs);
+const struct xfrm_mode_cbs *xfrm_get_mode_cbs(u8 mode, bool try_load);
 
 static inline int xfrm_af2proto(unsigned int family)
 {

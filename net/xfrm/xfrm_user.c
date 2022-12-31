@@ -1109,6 +1109,7 @@ static int copy_to_user_state_extra(struct xfrm_state *x,
 				    struct xfrm_usersa_info *p,
 				    struct sk_buff *skb)
 {
+	const struct xfrm_mode_cbs *mode_cbs;
 	int ret = 0;
 
 	copy_to_user_state(x, p);
@@ -1192,6 +1193,11 @@ static int copy_to_user_state_extra(struct xfrm_state *x,
 		if (ret)
 			goto out;
 	}
+	mode_cbs = xfrm_get_mode_cbs(x->props.mode);
+	if (mode_cbs && mode_cbs->copy_to_user)
+		ret = mode_cbs->copy_to_user(x, skb);
+	if (ret)
+		goto out;
 	if (x->mapping_maxage)
 		ret = nla_put_u32(skb, XFRMA_MTIMER_THRESH, x->mapping_maxage);
 out:

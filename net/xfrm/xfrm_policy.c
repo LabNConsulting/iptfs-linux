@@ -2611,6 +2611,7 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
 					    struct dst_entry *dst)
 {
 	const struct xfrm_state_afinfo *afinfo;
+	const struct xfrm_mode_cbs *mode_cbs;
 	const struct xfrm_mode *inner_mode;
 	struct net *net = xp_net(policy);
 	unsigned long now = jiffies;
@@ -2690,13 +2691,18 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
 
 		dst1->input = dst_discard;
 
-		rcu_read_lock();
-		afinfo = xfrm_state_afinfo_get_rcu(inner_mode->family);
-		if (likely(afinfo))
-			dst1->output = afinfo->output;
-		else
-			dst1->output = dst_discard_out;
-		rcu_read_unlock();
+		mode_cbs = xfrm_get_mode_cbs(xfrm[i]->props.mode);
+		if (mode_cbs && mode_cbs->output)
+			dst1->output = mode_cbs->output;
+		else {
+			rcu_read_lock();
+			afinfo = xfrm_state_afinfo_get_rcu(inner_mode->family);
+			if (likely(afinfo))
+				dst1->output = afinfo->output;
+			else
+				dst1->output = dst_discard_out;
+			rcu_read_unlock();
+		}
 
 		xdst_prev = xdst;
 
