@@ -44,7 +44,7 @@
 
 struct skb_wseq {
 	struct sk_buff *skb;
-	u64 seq;
+	u64 drop_time;
 };
 
 struct xfrm_iptfs_config {
@@ -346,7 +346,7 @@ static struct sk_buff *iptfs_alloc_header_skb(void)
 	struct sk_buff *skb;
 	uint resv = XFRM_IPTFS_MIN_HEADROOM;
 
-	pr_devinf("resv %u\n", len, resv);
+	pr_devinf("resv %u\n", resv);
 	skb = alloc_skb(resv, GFP_ATOMIC);
 	if (!skb) {
 		XFRM_INC_STATS(dev_net(skb->dev), LINUX_MIB_XFRMINERROR);
@@ -498,8 +498,8 @@ static int iptfs_complete_inner_skb(struct xfrm_state *x, struct sk_buff *skb,
 
 	/* XXX family here should be from outer or from inner packet */
 	/* XXX this is keeping interface stats and looking up dst
-		 * xfrmi interface if that's being used
-		 */
+	 * xfrmi interface if that's being used
+	 */
 	err = xfrm_rcv_cb(skb, family, x->type->proto, 0);
 	if (err) {
 		xfrm_rcv_cb(skb, family,
@@ -515,31 +515,6 @@ static int iptfs_complete_inner_skb(struct xfrm_state *x, struct sk_buff *skb,
 	skb_dst_drop(skb); /* XXX ok to do this on first_skb before done? */
 
 	return 0;
-}
-
-static enum hrtimer_restart iptfs_drop_timer(struct hrtimer *me)
-{
-	struct xfrm_iptfs_data *xtfs;
-	struct xfrm_state *x;
-
-	xtfs = container_of(me, typeof(*xtfs), drop_timer);
-	x = xtfs->x;
-
-	XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_DROP_TIMER_FIRES);
-
-	spin_lock(&xtfs->drop_lock);
-
-	if (!xtfs->ra_newskb) {
-		pr_devinf("drop timer -- but no reassembly\n");
-	} else {
-		pr_devinf("drop timer -- dropping reassemble\n");
-		kfree_skb(xtfs->ra_newskb);
-		xtfs->ra_newskb = NULL;
-	}
-
-	spin_unlock(&xtfs->drop_lock);
-
-	return HRTIMER_NORESTART;
 }
 
 static inline void _iptfs_reassem_done(struct xfrm_iptfs_data *xtfs, bool free)
@@ -649,10 +624,10 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 
 	if (!newskb || xtfs->ra_wantseq > seq) {
 		/*
-		* We are not reassembling or this is not the sequence
-		* number we are expecting. Skip the partial inner
-		* packet fragment at the start of this outer packet.
-		*/
+		 * We are not reassembling or this is not the sequence
+		 * number we are expecting. Skip the partial inner
+		 * packet fragment at the start of this outer packet.
+		 */
 		XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_MISSED_FRAG_START);
 		if (!newskb) {
 			pr_devinf(
@@ -1006,7 +981,7 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 			xtfs->ra_newskb = skb;
 			xtfs->ra_wantseq = seq + 1;
 			if (!hrtimer_is_queued(&xtfs->drop_timer)) {
-				pr_devinf("starting drop timer\n");
+				pr_devinf("starting drop timer, for reassem\n");
 				/* softirq blocked lest the timer fire and interrupt us */
 				BUG_ON(!in_interrupt());
 				hrtimer_start(&xtfs->drop_timer,
@@ -1091,6 +1066,62 @@ static int __reorder_past(struct xfrm_iptfs_data *xtfs, struct sk_buff *inskb,
 	return 0;
 }
 
+static uint __reorder_drop(struct xfrm_iptfs_data *xtfs, struct list_head *list)
+
+{
+	struct skb_wseq *s, *se;
+	const uint savedlen = xtfs->w_savedlen;
+	u64 wantseq = xtfs->w_wantseq;
+	time64_t now = ktime_get_raw_fast_ns();
+	uint count = 0;
+	uint scount = 0;
+
+	BUG_ON(!savedlen);
+	if (xtfs->w_saved[0].drop_time > now) {
+		pr_devinf("not yet time to drop\n");
+		goto set_timer;
+	}
+
+	pr_devinf("drop wanted seq %llu savedlen %u\n", wantseq, savedlen);
+	wantseq = ++xtfs->w_wantseq;
+
+	/* Keep flushing packets until we reach a drop time greater than now. */
+	s = xtfs->w_saved;
+	se = s + savedlen;
+	do {
+		/* Walking past empty slots until we reach a packet */
+		for (; s < se && !s->skb; s++)
+			if (s->drop_time > now)
+				goto outerdone;
+		/* Sending packets until we hit another empty slot. */
+		for (; s < se && s->skb; scount++, s++)
+			list_add_tail(&s->skb->list, list);
+	} while (s < se);
+outerdone:
+
+	count = s - xtfs->w_saved;
+	if (count) {
+		xtfs->w_wantseq += count;
+		pr_devinf("popped seq %llu to %llu from saved%s (sent %u)\n",
+			  wantseq, xtfs->w_wantseq - 1,
+			  count == savedlen ? " (all)" : "", scount);
+
+		/* Shift handled slots plus final empty slot into slot 0. */
+		__vec_shift(xtfs, count);
+	}
+
+	if (xtfs->w_savedlen) {
+	set_timer:
+		/* Drifting is OK */
+		pr_devinf("restarting drop timer, savedlen: %u\n",
+			  xtfs->w_savedlen);
+		hrtimer_start(&xtfs->drop_timer,
+			      xtfs->w_saved[0].drop_time - now,
+			      IPTFS_HRTIMER_MODE);
+	}
+	return scount;
+}
+
 static uint __reorder_this(struct xfrm_iptfs_data *xtfs, struct sk_buff *inskb,
 			   struct list_head *list)
 
@@ -1123,9 +1154,46 @@ static uint __reorder_this(struct xfrm_iptfs_data *xtfs, struct sk_buff *inskb,
 			  xtfs->w_wantseq - 1,
 			  count == savedlen ? " (all)" : "");
 	}
+
 	/* Shift handled slots plus final empty slot into slot 0. */
 	__vec_shift(xtfs, count + 1);
+
 	return count + 1;
+}
+
+/*
+ * Set the slot's drop time and all the empty slots below it until reaching a
+ * filled slot which will already be set.
+ */
+static void iptfs_set_window_drop_times(struct xfrm_iptfs_data *xtfs, int index)
+{
+	const uint savedlen = xtfs->w_savedlen;
+	struct skb_wseq *s = xtfs->w_saved;
+	time64_t drop_time;
+
+	assert_spin_locked(&xtfs->drop_lock);
+
+	if (savedlen > index + 1) {
+		/* we are below another, our drop time and the timer are already set */
+		BUG_ON(xtfs->w_saved[index + 1].drop_time !=
+		       xtfs->w_saved[index].drop_time);
+		return;
+	}
+	/* we are the most future so get a new drop time. */
+	drop_time = ktime_get_raw_fast_ns();
+	drop_time += xtfs->drop_time_ns;
+
+	/* Walk back through the array setting drop times as we go */
+	s[index].drop_time = drop_time;
+	while (index-- > 0 && s[index].skb == NULL)
+		s[index].drop_time = drop_time;
+
+	/* If we walked all the way back, schedule the drop timer if needed */
+	if (index == -1 && !hrtimer_is_queued(&xtfs->drop_timer)) {
+		pr_devinf("starting drop timer on first save\n");
+		hrtimer_start(&xtfs->drop_timer, xtfs->drop_time_ns,
+			      IPTFS_HRTIMER_MODE);
+	}
 }
 
 static uint __reorder_future_fits(struct xfrm_iptfs_data *xtfs,
@@ -1187,6 +1255,8 @@ static uint __reorder_future_fits(struct xfrm_iptfs_data *xtfs,
 
 	xtfs->w_saved[index].skb = inskb;
 	xtfs->w_savedlen = max(savedlen, index + 1);
+	iptfs_set_window_drop_times(xtfs, index);
+
 	return 0;
 }
 
@@ -1229,9 +1299,10 @@ static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 		inseq, wantseq, distance, savedlen, nslots);
 
 	/*
-	 * ex: slot count is 4, array size is 3 savedlen is 2
+	 * ex: slot count is 4, array size is 3 savedlen is 2, slot 0 is the
+	 * missing sequence number.
 	 *
-	 * the final slot at savedlen (index savelen - 1) is always occupied.
+	 * the final slot at savedlen (index savedlen - 1) is always occupied.
 	 *
 	 * beyond is "beyond array size" not savedlen.
 	 *
@@ -1248,9 +1319,10 @@ static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 	 *
 	 * We receive seq number 6
 	 * distance == 4 [inseq(6) - w_wantseq(2)]
-	 * index == 3 [distance(6) - 1]
-	 * beyond == 1 [slot(4) - lastslot((nslots(4) - 1))]
-	 * shifting == 1 [min(savedlen(2), beyond(3)]
+	 * newslot == distance
+	 * index == 3 [distance(4) - 1]
+	 * beyond == 1 [newslot(4) - lastslot((nslots(4) - 1))]
+	 * shifting == 1 [min(savedlen(2), beyond(1)]
 	 * slot0_skb == [b], and should match w_wantseq
 	 *
 	 *                +--- window boundary (nslots == 4)
@@ -1261,8 +1333,9 @@ static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 	 *
 	 * We receive seq number 6
 	 * distance == 4 [inseq(6) - w_wantseq(2)]
+	 * newslot == distance
 	 * index == 3 [distance(4) - 1]
-	 * beyond == 1 [slot(4) - lastslot((nslots(4) - 1))]
+	 * beyond == 1 [newslot(4) - lastslot((nslots(4) - 1))]
 	 * shifting == 1 [min(savedlen(1), beyond(1)]
 	 * slot0_skb == [b] and should match w_wantseq
 	 *
@@ -1279,9 +1352,12 @@ static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 	 *
 	 * We receive seq number 8
 	 * distance == 6 [inseq(8) - w_wantseq(2)]
+	 * newslot == distance
 	 * index == 5 [distance(6) - 1]
-	 * beyond == 3 [slot(6) - lastslot((nslots(4) - 1))]
+	 * beyond == 3 [newslot(6) - lastslot((nslots(4) - 1))]
 	 * shifting == 2 [min(savedlen(2), beyond(3)]
+	 *
+	 * XXXX what's this next thing? why isn't it [c]?
 	 * slot0_skb == NULL changed from [b] when "savedlen < beyond" is true.
 	 */
 
@@ -1290,12 +1366,13 @@ static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 	 * for missing packets that are exiting the window as we shift it.
 	 */
 
-	/* If savedlen < beyond we are shifting some, else all. */
+	/* If savedlen > beyond we are shifting some, else all. */
 	shifting = min(savedlen, beyond);
 
 	/* slot0 is the buf that just shifted out and into slot0 */
 	slot0 = NULL;
 	s0seq = wantseq;
+	last_drop_seq = s0seq;
 	wnext = xtfs->w_saved;
 	for (slot = 1; slot <= shifting; slot++, wnext++) {
 		/* handle what was in slot0 before we occupy it */
@@ -1315,7 +1392,8 @@ static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 
 	/*
 	 * slot0 is now either NULL (in which case it's what we now are waiting
-	 * for, or a buf in which case we need to handle it like we received it.
+	 * for, or a buf in which case we need to handle it like we received it;
+	 * however, we may be advancing past that buffer as well..
 	 */
 
 	/*
@@ -1328,19 +1406,26 @@ static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 		extra_drops = beyond - savedlen;
 		if (savedlen == 0) {
 			BUG_ON(slot0);
-			extra_drops++;
 			pr_devinf("no slot0 skipping %llu more", extra_drops);
+			s0seq += extra_drops;
+			last_drop_seq = s0seq - 1;
 		} else {
+			extra_drops--; /* we aren't dropping what's in slot0 */
 			BUG_ON(!slot0);
 			pr_devinf("send slot0: %llu and skipping %llu more",
 				  s0seq, extra_drops);
 			list_add_tail(&slot0->list, list);
+			/* if extra_drops then we are going past this slot0
+			 * so we can safely advance last_drop_seq
+			 */
+			if (extra_drops)
+				last_drop_seq = s0seq + extra_drops;
+			s0seq += extra_drops + 1;
 			count++;
 		}
-
 		missed += extra_drops;
-		last_drop_seq = s0seq + extra_drops;
 		slot0 = NULL;
+		/* slot0 has had an empty slot pushed into it */
 	}
 
 	/* Remove the entries */
@@ -1360,6 +1445,7 @@ static uint __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 	/* We've shifted. plug the packet in at the end. */
 	xtfs->w_savedlen = nslots - 1;
 	xtfs->w_saved[xtfs->w_savedlen - 1].skb = inskb;
+	iptfs_set_window_drop_times(xtfs, xtfs->w_savedlen - 1);
 
 	/* if we don't have a slot0 then we must wait for it */
 	if (!slot0)
@@ -1410,6 +1496,72 @@ static uint iptfs_input_reorder(struct xfrm_iptfs_data *xtfs,
 	else
 		return __reorder_future_shifts(xtfs, inskb, list, freelist,
 					       fcount);
+}
+
+/*
+ * Handle drop timer expiry, this is similar to our input function.
+ *
+ * The drop timer is set when we start an in progress reassembly, and also when
+ * we save a future packet in the window saved array.
+ *
+ * NOTE packets in the save window are always newer WRT drop times as
+ * they get further in the future. i.e. for:
+ *
+ *    if slots (S0, S1, ... Sn) and `Dn` is the drop time for slot `Sn`,
+ *    then D(n-1) <= D(n).
+ *
+ * So, regardless of why the timer is firing we can always discard any inprogress
+ * fragment; either it's the reassembly timer, or slot 0 is going to be
+ * dropped as S0 must have the most recent drop time, and slot 0 holds the
+ * continuation fragment of the in progress packet.
+ */
+static enum hrtimer_restart iptfs_drop_timer(struct hrtimer *me)
+{
+	struct sk_buff *skb, *next;
+	struct list_head freelist, list;
+	struct xfrm_iptfs_data *xtfs;
+	struct xfrm_state *x;
+	uint count, fcount;
+
+	xtfs = container_of(me, typeof(*xtfs), drop_timer);
+	x = xtfs->x;
+
+	XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_DROP_TIMER_FIRES);
+
+	spin_lock(&xtfs->drop_lock);
+
+	INIT_LIST_HEAD(&list);
+	INIT_LIST_HEAD(&freelist);
+	fcount = 0;
+
+	/*
+         * Drop any in progress packet
+         */
+
+	if (!xtfs->ra_newskb) {
+		pr_devinf("no in-progress reassembly\n");
+	} else {
+		pr_devinf("dropping in-progress reassemble\n");
+		kfree_skb(xtfs->ra_newskb);
+		xtfs->ra_newskb = NULL;
+	}
+
+	/*
+         * Now drop as many packets as we should from the reordering window
+         * saved array
+         */
+	count = xtfs->w_savedlen ? __reorder_drop(xtfs, &list) : 0;
+
+	spin_unlock(&xtfs->drop_lock);
+
+	if (count) {
+		pr_devinf("receiving ordered list of len %u\n", count);
+		list_for_each_entry_safe (skb, next, &list, list) {
+			skb_list_del_init(skb);
+			(void)iptfs_input_ordered(xfrm_input_gro_cells, x, skb);
+		}
+	}
+	return HRTIMER_NORESTART;
 }
 
 /*
@@ -1606,7 +1758,7 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 
 	/* Start a delay timer if we don't have one yet */
 	if (!hrtimer_is_queued(&xtfs->iptfs_timer)) {
-		pr_devinf("starting hrtimer\n");
+		pr_devinf("starting drop timer for reassembly\n");
 		/* softirq blocked lest the timer fire and interrupt us */
 		BUG_ON(!in_interrupt());
 		hrtimer_start(&xtfs->iptfs_timer, xtfs->init_delay_ns,
