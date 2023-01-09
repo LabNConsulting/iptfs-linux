@@ -496,6 +496,11 @@ static int iptfs_complete_inner_skb(struct xfrm_state *x, struct sk_buff *skb,
 				IP6_ECN_set_ce(skb, ipv6_hdr(skb));
 	}
 
+	/*
+	 * This remaining code here is based on the tunnel branch at the
+	 * xfrm_input(). Should consider refactoring it.
+	 */
+
 	/* XXX family here should be from outer or from inner packet */
 	/* XXX this is keeping interface stats and looking up dst
 	 * xfrmi interface if that's being used
@@ -512,7 +517,14 @@ static int iptfs_complete_inner_skb(struct xfrm_state *x, struct sk_buff *skb,
 	sp = skb_sec_path(skb);
 	if (sp)
 		sp->olen = 0;
-	skb_dst_drop(skb); /* XXX ok to do this on first_skb before done? */
+
+		/* XXX ok to do this on first_skb before done? */
+#if 0 // in master..
+	if (skb_valid_dst(skb))
+		skb_dst_drop(skb);
+#else
+	skb_dst_drop(skb);
+#endif
 
 	return 0;
 }
@@ -859,12 +871,6 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 			XFRM_INC_STATS(net, LINUX_MIB_XFRMINBUFFERERROR);
 			goto done;
 		}
-
-		/* /\* XXX chopps: fragmentation support *\/ */
-		/* if (iplen > remaining || iphlen > remaining) { */
-		/* 	XFRM_INC_STATS(net, LINUX_MIB_XFRMINBUFFERERROR); */
-		/* 	goto done; */
-		/* } */
 
 		if (unlikely(skbseq.stepped_offset)) {
 			/*
