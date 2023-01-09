@@ -1750,12 +1750,6 @@ int xfrm_iptfs_output_collect(struct net *net, struct sock *sk,
 		pr_devinf("%s received non-gso skb\n",
 			  qcount ? "queued" : "dropped");
 
-	if (!ok) {
-		/* Sanity check, if queue was full time should be set */
-		BUG_ON(xtfs->queue_size &&
-		       !hrtimer_is_queued(&xtfs->iptfs_timer));
-	}
-
 	/* Start a delay timer if we don't have one yet */
 	if (!hrtimer_is_queued(&xtfs->iptfs_timer)) {
 		pr_devinf("starting drop timer for reassembly\n");
