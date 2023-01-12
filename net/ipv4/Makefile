@@ -75,13 +75,24 @@ endif
 
 CFLAGS_REMOVE_esp4.o = -g -O2
 CFLAGS_esp4.o = -g3 -O1
+GCOV_PROFILE_esp4.o := y
+
 CFLAGS_REMOVE_xfrm4_input.o = -g -O2
 CFLAGS_xfrm4_input.o = -g3 -O1
+GCOV_PROFILE_xfrm4_input.o := y
+
 CFLAGS_REMOVE_xfrm4_output.o = -g -O2
 CFLAGS_xfrm4_output.o = -g3 -O1
+GCOV_PROFILE_xfrm4_output.o := y
+
 CFLAGS_REMOVE_xfrm4_policy.o = -g -O2
 CFLAGS_xfrm4_policy.o = -g3 -O1
+GCOV_PROFILE_xfrm4_policy.o := y
+
 CFLAGS_REMOVE_xfrm4_protocol.o = -g -O2
 CFLAGS_xfrm4_protocol.o = -g3 -O1
+GCOV_PROFILE_xfrm4_protocol.o := y
+
 CFLAGS_REMOVE_xfrm4_state.o = -g -O2
 CFLAGS_xfrm4_state.o = -g3 -O1
+GCOV_PROFILE_xfrm4_state.o := y
