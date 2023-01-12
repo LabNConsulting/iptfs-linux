@@ -23,3 +23,7 @@ obj-$(CONFIG_XFRM_INTERFACE) += xfrm_interface.o
 obj-$(CONFIG_XFRM_IPTFS) += xfrm_iptfs.o
 obj-$(CONFIG_XFRM_ESPINTCP) += espintcp.o
 obj-$(CONFIG_DEBUG_INFO_BTF) += xfrm_state_bpf.o
+
+CFLAGS_REMOVE_xfrm_iptfs.o = -g -O2
+CFLAGS_xfrm_iptfs.o = -g3 -O1
+GCOV_PROFILE_xfrm_iptfs.o := y
