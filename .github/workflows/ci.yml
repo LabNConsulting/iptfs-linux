@@ -1,0 +1,385 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  build-fast-kernel:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout testing repository in root folder
+        uses: actions/checkout@v4
+        with:
+          repository: LabNConsulting/iptfs-dev
+
+      - name: Checkout source repository under linux
+        uses: actions/checkout@v4
+        with:
+          path: linux
+
+      - name: Install build depencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ccache device-tree-compiler libelf-dev xz-utils
+
+      - name: Kernel build cache
+        id: linux-cache
+        uses: actions/cache@v4
+        with:
+          path: output-linux
+          # We need a unique key name in order for new versions to save
+          key: ${{ runner.os }}-kernel-${{ hashFiles('linux-fast.config', 'output-linux/**/*.[ch]', 'linux/**/*.[ch]') }}
+          restore-keys: |
+            key: ${{ runner.os }}-kernel-
+
+      - name: Build kernel
+        run: |
+          set -x
+          if [ -d output-linux ]; then
+            echo "Cache found, checking for config difference"
+            # If the kernel config is changed just wipe the cache
+            if ! diff -q -u1 linux-fast.config output-linux/.config -I '^[ \t]*#' -I '^[ \t]*$' 2>/dev/null; then
+              echo "Kernel configs differ erasing cache"
+              rm -rf output-linux
+            fi
+          fi
+
+          export CCACHE_DIR=$PWD/output-linux/.ccache
+          if [ ! -d output-linux ]; then
+            echo "Creating new output directory"
+            mkdir output-linux
+            cp linux-fast.config output-linux/.config
+          fi
+          cd output-linux
+          ccache -z
+          KBUILD_BUILD_TIMESTAMP='' make CC="ccache gcc" LINUXCONFIG=linux-fast.config O=$PWD -j2 -C ../linux
+          ccache -sz
+          [ -e arch/x86/boot/bzImage ] && cp arch/x86/boot/bzImage ..
+          # Ccache keeps it's own objects
+          # make clean
+
+      - name: Archive kernel bzImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-bzImage
+          path: bzImage
+          retention-days: 1
+
+  build-cov-kernel:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout testing repository in root folder
+        uses: actions/checkout@v4
+        with:
+          repository: LabNConsulting/iptfs-dev
+
+      - name: Checkout source repository under linux
+        uses: actions/checkout@v4
+        with:
+          ref: iptfs-ci
+          path: linux
+
+      - name: Install build depencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ccache device-tree-compiler libelf-dev xz-utils
+
+      - name: Coverage kernel build cache
+        id: linux-cov-cache
+        uses: actions/cache@v4
+        with:
+          path: output-linux
+          # We need a unique key name in order for new versions to save
+          key: ${{ runner.os }}-cov-kernel-${{ hashFiles('linux-cov.config', 'output-linux/**/*.[ch]', 'linux/**/*.[ch]') }}
+          restore-keys: |
+            key: ${{ runner.os }}-cov-kernel-
+
+      - name: Build coverage kernel
+        run: |
+          set -x
+          if [ -d output-linux ]; then
+            echo "Cache found, checking for config difference"
+            # If the kernel config is changed just wipe the cache
+            if ! diff -q -u1 linux-cov.config output-linux/.config -I '^[ \t]*#' -I '^[ \t]*$' 2>/dev/null; then
+              echo "Kernel configs differ erasing cache"
+              rm -rf output-linux
+            fi
+          fi
+
+          export CCACHE_DIR=$PWD/output-linux/.ccache
+          if [ ! -d output-linux ]; then
+            echo "Creating new output directory"
+            mkdir output-linux
+            cp linux-cov.config output-linux/.config
+          fi
+          cd output-linux
+          ccache -z
+          KBUILD_BUILD_TIMESTAMP='' make CC="ccache gcc" LINUXCONFIG=linux-cov.config O=$PWD -j2 -C ../linux
+          ccache -sz
+          [ -e arch/x86/boot/bzImage ] && cp arch/x86/boot/bzImage ..
+          # Ccache keeps it's own objects
+          # We want the objects and images too for now, restroy once we know
+          # coverage works
+          # make clean
+
+      - name: Archive coverage kernel bzImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-cov-bzImage
+          path: bzImage
+          retention-days: 1
+
+  build-rootfs:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 600
+    steps:
+      - name: Checkout testing repository in root folder
+        uses: actions/checkout@v4
+        with:
+          repository: LabNConsulting/iptfs-dev
+
+      - name: Checkout kernel repository
+        uses: actions/checkout@v4
+        with:
+          path: linux
+
+      - name: Checkout other repos
+        run: make setup SHALLOW_CLONE=1
+
+      - name: Install build depencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y device-tree-compiler libelf-dev
+
+      - name: Buildroot Build Cache
+        id: buildroot-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            output-buildroot
+            root-key
+            root-key.pub
+          key: ${{ runner.os }}-br-${{ hashFiles('buildroot-ci.config', 'buildroot/dl/**', 'output-buildroot/build/linux-custom/.config', 'output-buildroot/build/linux-custom/**/*.c', 'output-buildroot/build/linux-custom/**/*.h', 'root-key', 'root-key.pub') }}
+          restore-keys: |
+            key: ${{ runner.os }}-br-
+
+      - name: Build Rootfs
+        timeout-minutes: 540
+        run: |
+          set -x
+          if [ -f output-buildroot.tar.xz ] || [ -f output-buildroot.tar.gz ]; then
+            echo "Cache found, extracting"
+            if [ -f output-buildroot.tar.xz ]; then
+              tar -xpJf output-buildroot.tar.xz
+            else
+              tar -xpzf output-buildroot.tar.gz
+            fi
+            # If the buildroot config is changed just wipe the cache
+            if ! diff -q -u1 buildroot-ci.config output-buildroot/.config -I '^[ \t]*#' -I '^[ \t]*$' 2>/dev/null; then
+              echo "Buildroot configs differ erasing cache"
+              rm -rf output-buildroot output-buildroot.tar.gz
+            fi
+          fi
+
+          if [ ! -d output-buildroot ]; then
+            echo "Creating new output directory"
+            mkdir -p output-buildroot
+            cp -p buildroot-ci.config output-buildroot/.config
+          else
+            make -C buildroot -j6 V=0 O=$PWD/output-buildroot iproute2-dirclean
+          fi
+          # make rootfs
+          echo "Starting build: $(date)"
+          make -C buildroot -j6 V=1 O=$PWD/output-buildroot LOCALVERSION='' > build-buildroot.txt 2>&1
+          echo "Build complete: $(date)"
+
+      - name: Archive buildroot build log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildroot-build-log
+          path: build-buildroot.txt
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Archive buildroot rootfs.cpio.gz
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-compressed-cpio
+          path: output-buildroot/images/rootfs.cpio.gz
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Archive buildroot root-key
+        uses: actions/upload-artifact@v4
+        with:
+          name: root-key
+          path: |
+            root-key
+            root-key.pub
+          retention-days: 1
+          if-no-files-found: error
+
+  test:
+    runs-on: ubuntu-22.04
+    needs: ["build-cov-kernel", "build-rootfs"]
+    steps:
+      - name: Checkout testing repository in root folder
+        uses: actions/checkout@v4
+        with:
+          repository: LabNConsulting/iptfs-dev
+
+      - name: Checkout kernel repository
+        uses: actions/checkout@v4
+        with:
+          path: linux
+
+      - name: Install test depencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y lcov qemu-system-x86 socat
+          sudo python3 -m pip install -U munet pytest pytest-asyncio scapy
+
+      #
+      # For coverage data, extract the source and full build to get the gcno
+      # files.
+      #
+
+      - name: Restore coverage kernel build
+        id: linux-cov-cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: output-linux
+          # We need a unique key name in order for new versions to save
+          key: ${{ runner.os }}-cov-kernel-${{ hashFiles('linux-cov.config', 'output-linux/**/*.[ch]', 'linux/**/*.[ch]') }}
+          restore-keys: |
+            key: ${{ runner.os }}-cov-kernel-
+
+      #
+      # We only need to artifacts for buildroot
+      #
+      - name: Fetch buildroot rootfs.cpio.gz archive
+        uses: actions/download-artifact@v4
+        with:
+          name: rootfs-compressed-cpio
+
+      - name: Fetch root-key
+        uses: actions/download-artifact@v4
+        with:
+          name: root-key
+
+      # Would be nice to loop this w/ and w/o coverage
+
+      - name: Prep tests
+        run: |
+          test -f output-linux/arch/x86/boot/bzImage
+          mkdir -p output-buildroot/images/
+          mv rootfs.cpio.gz output-buildroot/images/
+          mkdir -p test-logs
+
+      - name: Print the environment under sudo
+        run: |
+          sudo -E env
+          qemu-system-x86_64 --version
+          munet --version
+
+      - name: Config test
+        run: |
+          set -e
+          set -o pipefail
+          tmpf=test-logs/results-config.txt
+          sudo -E env CI=$CI python3 -m pytest -s --coverage --cov-build-dir=$PWD/output-linux tests/config |& tee $tmpf
+          grep -qvz SKIPPED $tmpf
+
+      - name: Errors test
+        run: |
+          set -e
+          set -o pipefail
+          tmpf=test-logs/results-errors.txt
+          sudo -E env CI=$CI python3 -m pytest -s --coverage --cov-build-dir=$PWD/output-linux tests/errors |& tee $tmpf
+          grep -qvz SKIPPED $tmpf
+
+      - name: Simple test
+        run: |
+          set -e
+          set -o pipefail
+          tmpf=test-logs/results-simplenet.txt
+          sudo -E env CI=$CI python3 -m pytest -s --coverage --cov-build-dir=$PWD/output-linux tests/simplenet |& tee $tmpf
+          grep -qvz SKIPPED $tmpf
+
+      # Restore longer running test once working
+      - name: UT packet test
+        run: |
+          set -e
+          set -o pipefail
+          tmpf=test-logs/results-utpkt.txt
+          sudo python3 -m pytest -s --coverage --cov-build-dir=$PWD/output-linux tests/utpkt |& tee $tmpf
+          grep -qvz SKIPPED $tmpf
+
+      - name: Extract coverage data
+        if: ${{ always() }}
+        run: |
+          make ci-extract-cov
+          ls -l test-logs
+          ls -l ./coverage.info
+          cp ./coverage.info linux/coverage.info
+          # # Cannot get codecov-action to work at all!
+          # curl -so codecov.sh https://codecov.io/bash
+          # cd linux
+          # bash ../codecov.sh -f ../test-logs/coverage.info -t ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          disable_search: true
+          fail_ci_if_error: false
+          file: ../test-logs/coverage.info
+          flags: unittests
+          plugin: noop
+          token: ${{ secrets.CODECOV_TOKEN }}
+          verbose: true
+          working-directory: ./linux
+
+      - name: Collect test logs
+        if: ${{ always() }}
+        run: |
+          sudo find /tmp/unet-test -name 'gcov-data.tgz' -exec rm {} +
+          sudo find /tmp/unet-test -type s -exec rm {} +
+          sudo tar -C /tmp/unet-test -cf - . | tar -C test-logs -xf -
+          tar -cjf test-logs.tar.bz2 test-logs
+
+      - name: Archive test logs tarball
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-tar
+          path: test-logs.tar.bz2
+
+  deploy:
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: ["build-fast-kernel", "build-rootfs", "test"]
+    steps:
+
+      - name: Download kernel bzImage
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-bzImage
+
+      - name: Download buildroot rootfs.cpio.gz
+        uses: actions/download-artifact@v4
+        with:
+          name: rootfs-compressed-cpio
+
+      - name: Downlaod root-key
+        uses: actions/download-artifact@v4
+        with:
+          name: root-key
+
+      - name: Deploy
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            bzImage
+            root-key
+            root-key.pub
+            rootfs.cpio.gz
