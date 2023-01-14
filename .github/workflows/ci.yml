@@ -33,6 +33,7 @@ jobs:
 
       - name: Build kernel
         run: |
+          set -x
           rm -rf output-linux
           if [ -f output-linux.tar.xz ]; then
             echo "Cache found, extracting"
@@ -184,6 +185,7 @@ jobs:
 
       - name: Build Rootfs
         run: |
+          set -x
           if [ -f output-buildroot.tar.xz ] || [ -f output-buildroot.tar.gz ]; then
             echo "Cache found, extracting"
             if [ -f output-buildroot.tar.xz ]; then
@@ -322,13 +324,13 @@ jobs:
           sudo -E env CI=$CI python3 -m pytest -s --coverage tests/simplenet | tee $tmpf
           grep -v SKIPPED $tmpf
 
-      # Restore longer running test once working
-      # - name: UT packet test
-      #   run: |
-      #     set -e
-      #     tmpf=test-logs/results-utpkt.txt
-      #     sudo python3 -m pytest -s --coverage tests/utpkt | tee $tmpf
-      #     grep -v SKIPPED $tmpf
+      Restore longer running test once working
+      - name: UT packet test
+        run: |
+          set -e
+          tmpf=test-logs/results-utpkt.txt
+          sudo python3 -m pytest -s --coverage tests/utpkt | tee $tmpf
+          grep -v SKIPPED $tmpf
 
       - name: Extract coverage data
         if: ${{ always() }}
@@ -339,12 +341,9 @@ jobs:
         uses: codecov/codecov-action@v3
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          env_vars: OS,PYTHON
-          fail_ci_if_error: true
           files: ./coverage.info
           flags: unittests
-          name: codecov-umbrella
-          path_to_write_report: ./test-logs/codecov_report.txt
+          root_dir: ./linux
           verbose: true
 
       - name: Collect test logs
