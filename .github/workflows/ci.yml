@@ -2,6 +2,10 @@ name: CI
 
 on: [push, pull_request]
 
+#
+# Make sure to update the copy of this in `iptfs-dev` as well.
+#
+
 jobs:
   build-fast-kernel:
     runs-on: ubuntu-22.04
@@ -372,11 +376,15 @@ jobs:
         with:
           name: rootfs-compressed-cpio
 
+      - name: Downlaod root-key
+        uses: actions/download-artifact@v3
+        with:
+          name: root-key
+
       - name: Deploy
         uses: softprops/action-gh-release@v1
         with:
           files: |
             bzImage
             root-key
-            root-key.pub
             rootfs.cpio.gz
