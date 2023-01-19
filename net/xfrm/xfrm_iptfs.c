@@ -441,7 +441,7 @@ static uint __iptfs_iplen(u8 *data)
 	if (iph->version == 0x4)
 		return ntohs(iph->tot_len);
 	BUG_ON(iph->version != 0x6);
-	return ntohs(((struct ipv6hdr *)iph)->payload_len);
+	return ntohs(((struct ipv6hdr *)iph)->payload_len) + sizeof(struct ipv6hdr);
 }
 
 static uint __iptfs_iphdrlen(u8 *data)
@@ -449,9 +449,10 @@ static uint __iptfs_iphdrlen(u8 *data)
 	struct iphdr *iph = (struct iphdr *)data;
 	if (iph->version == 0x4)
 		return iph->ihl << 2;
-	else if (iph->version == 0x6)
+	else if (iph->version == 0x6) {
 		/* XXX check other kernel cases for transport offset */
 		return sizeof(struct ipv6hdr);
+	}
 	return 0;
 }
 
@@ -459,41 +460,44 @@ static int iptfs_complete_inner_skb(struct xfrm_state *x, struct sk_buff *skb,
 				    uint iphlen)
 {
 	struct sec_path *sp;
-	struct iphdr *iph;
 	int err, family;
 
-	if ((family = x->sel.family) == AF_UNSPEC)
-		family = x->outer_mode.family;
-
 	skb_reset_network_header(skb);
+	/* This may be unnecessary as the the inner packet is going to be
+	 * delivered back to the resulting L3 input path which will set the
+	 * transport header as appropriate
+	 */
 	skb_set_transport_header(skb, iphlen);
 
 	/*
-	 * XXX Need to figure out how to get no head buffer data.
-	 * as this doesn't work if the ip header is in a fragment,
-	 * that won't happen with our allocated, but what about re-use of
-	 * initial input? Do we need to only do reuse if the header is available
-	 * in the headroom of the initial skb?
+	 * Our skb will contain the header data copied when this outer packet
+	 * which contained the start of this inner packet. This is true
+	 * when we allocate a new skb as well as when we reuse the existing skb.
 	 */
-	iph = ip_hdr(skb);
+	if (ip_hdr(skb)->version == 0x4) {
+		struct iphdr *iph = ip_hdr(skb);
 
-	pr_devinf("completing inner, iplen %u skb len %u iphlen %u\n",
-		  ntohs(iph->tot_len), skb->len, iphlen);
+		pr_devinf("completing inner, iplen %u skb len %u iphlen %u\n",
+			  ntohs(iph->tot_len), skb->len, iphlen);
 
-	if (iph->version == 0x4) {
+		family = AF_INET;
 		if (x->props.flags & XFRM_STATE_DECAP_DSCP)
-			ipv4_copy_dscp(XFRM_MODE_SKB_CB(skb)->tos,
-				       ipip_hdr(skb));
+			ipv4_copy_dscp(XFRM_MODE_SKB_CB(skb)->tos, iph);
 		if (!(x->props.flags & XFRM_STATE_NOECN))
 			if (INET_ECN_is_ce(XFRM_MODE_SKB_CB(skb)->tos))
 				IP_ECN_set_ce(iph);
 	} else {
+		struct ipv6hdr *iph = ipv6_hdr(skb);
+
+		pr_devinf("completing inner, iplen %u skb len %u iphlen %u\n",
+			  ntohs(ipv6_hdr(skb)->payload_len), skb->len, iphlen);
+
+		family = AF_INET6;
 		if (x->props.flags & XFRM_STATE_DECAP_DSCP)
-			ipv6_copy_dscp(XFRM_MODE_SKB_CB(skb)->tos,
-				       ipv6_hdr(skb));
+			ipv6_copy_dscp(XFRM_MODE_SKB_CB(skb)->tos, iph);
 		if (!(x->props.flags & XFRM_STATE_NOECN))
 			if (INET_ECN_is_ce(XFRM_MODE_SKB_CB(skb)->tos))
-				IP6_ECN_set_ce(skb, ipv6_hdr(skb));
+				IP6_ECN_set_ce(skb, iph);
 	}
 
 	/*
@@ -501,10 +505,7 @@ static int iptfs_complete_inner_skb(struct xfrm_state *x, struct sk_buff *skb,
 	 * xfrm_input(). Should consider refactoring it.
 	 */
 
-	/* XXX family here should be from outer or from inner packet */
-	/* XXX this is keeping interface stats and looking up dst
-	 * xfrmi interface if that's being used
-	 */
+	/* track stats for any xfrmi interface being used. */
 	err = xfrm_rcv_cb(skb, family, x->type->proto, 0);
 	if (err) {
 		xfrm_rcv_cb(skb, family,
@@ -518,7 +519,7 @@ static int iptfs_complete_inner_skb(struct xfrm_state *x, struct sk_buff *skb,
 	if (sp)
 		sp->olen = 0;
 
-		/* XXX ok to do this on first_skb before done? */
+	/* XXX ok to do this on first_skb before done? */
 #if 0 // in master..
 	if (skb_valid_dst(skb))
 		skb_dst_drop(skb);
@@ -820,8 +821,9 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 	BUG_ON(xtfs->ra_newskb && data < tail);
 
 	while (data < tail) {
-		remaining = tail - data;
+		uint protocol = 0;
 
+		remaining = tail - data;
 		/*
 		 * `data` points at the start of the next data block.
 		 */
@@ -844,6 +846,7 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 
 			iplen = htons(iph->tot_len);
 			iphlen = iph->ihl << 2;
+			protocol = htons(ETH_P_IP);
 			pr_devinf("ipv4 inner length %u\n", iplen);
 		} else if (iph->version == 0x6) {
 			/* must have at least payload_len field present */
@@ -856,9 +859,11 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 			}
 
 			iplen = htons(((struct ipv6hdr *)hbytes)->payload_len);
+			iplen += sizeof(struct ipv6hdr);
 			/* XXX chopps: what about extra headers? ipv6_input
                          * seems to just do this */
 			iphlen = sizeof(struct ipv6hdr);
+			protocol = htons(ETH_P_IPV6);
 			pr_devinf("ipv6 inner length %u\n", iplen);
 		} else if (iph->version == 0x0) {
 			/* pad */
@@ -918,7 +923,10 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 				tail = skb->len;
 				remaining = skb->len;
 
+				skb->protocol = protocol;
 				skb_mac_header_rebuild(skb);
+				if (skb->mac_len)
+					eth_hdr(skb)->h_proto = skb->protocol;
 
 				/* We could have more iplen than remaining, if
 				 * the skb we received has extra tailroom that
@@ -954,16 +962,17 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 			capturelen = min(iplen, remaining);
 			skb = iptfs_pskb_extract_seq(iplen, resv, &skbseq, data,
 						     capturelen);
-			if (!skb) {
+			if (!skb)
 				continue;
-			}
 			pr_devinf("alloc'd new skb %p\n", skb);
 
+			skb->protocol = protocol;
 			if (old_mac) {
 				/* rebuild the mac header */
 				skb_set_mac_header(skb, -first_skb->mac_len);
 				memcpy(skb_mac_header(skb), old_mac,
 				       first_skb->mac_len);
+				eth_hdr(skb)->h_proto = skb->protocol;
 			}
 		}
 
@@ -1807,7 +1816,13 @@ static void iptfs_output_prepare_skb(struct sk_buff *skb, uint blkoff)
 	skb->network_header -= hsz;
 
 	IPCB(skb)->flags |= IPSKB_XFRM_TUNNEL_SIZE;
-	skb->protocol = htons(ETH_P_IP);
+
+	/* xfrm[46]_prepare_output sets skb->protocol here, but the resulting
+	 * called ip[6]_output functions also set this value as appropriate so
+	 * seems unnecessary
+	 *
+	 * skb->protocol = htons(ETH_P_IP) or htons(ETH_P_IPV6);
+	 */
 }
 
 static int iptfs_first_skb(struct sk_buff **skbp, bool df, uint mtu,
