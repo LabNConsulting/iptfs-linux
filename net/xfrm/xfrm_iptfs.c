@@ -27,10 +27,10 @@
 /* #define IPTFS_ENET_OHEAD (14 + 4 + 8 + 12) */
 /* #define GE_PPS(ge, iptfs_ip_mtu) ((1e8 * 10 ^ (ge - 1) / 8) / (iptfs_ip_mtu)) */
 
-#define PR_DEBUG_INFO
-#define PR_DEBUG_STATE
-#define PR_DEBUG_INGRESS
-#define PR_DEBUG_EGRESS
+#undef PR_DEBUG_INFO
+#undef PR_DEBUG_STATE
+#undef PR_DEBUG_INGRESS
+#undef PR_DEBUG_EGRESS
 
 #ifdef PR_DEBUG_INFO
 #define _pr_devinf(...) pr_info(__VA_ARGS__)
@@ -504,6 +504,8 @@ static int iptfs_complete_inner_skb(struct xfrm_state *x, struct sk_buff *skb,
 		if (!(x->props.flags & XFRM_STATE_NOECN))
 			if (INET_ECN_is_ce(XFRM_MODE_SKB_CB(skb)->tos))
 				IP_ECN_set_ce(iph);
+
+		skb->protocol = htons(ETH_P_IP);
 	} else {
 		struct ipv6hdr *iph = ipv6_hdr(skb);
 
@@ -517,6 +519,8 @@ static int iptfs_complete_inner_skb(struct xfrm_state *x, struct sk_buff *skb,
 		if (!(x->props.flags & XFRM_STATE_NOECN))
 			if (INET_ECN_is_ce(XFRM_MODE_SKB_CB(skb)->tos))
 				IP6_ECN_set_ce(skb, iph);
+
+		skb->protocol = htons(ETH_P_IPV6);
 	}
 
 	/*
