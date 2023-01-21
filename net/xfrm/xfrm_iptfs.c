@@ -9,6 +9,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/icmpv6.h>
 #include <net/icmp.h>
 #include <net/inet_ecn.h>
 #include <net/iptfs.h>
@@ -96,22 +97,32 @@ static enum hrtimer_restart iptfs_drop_timer(struct hrtimer *me);
 
 static inline uint _proto(struct sk_buff *skb)
 {
-	return ((struct iphdr *)skb->data)->protocol;
+	if (((struct iphdr *)skb->data)->version == 4)
+		return ((struct iphdr *)skb->data)->protocol;
+	return ((struct ipv6hdr *)skb->data)->nexthdr;
 }
 
 static inline uint _seq(struct sk_buff *skb)
 {
-	uint protocol = _proto(skb);
+	void *nexthdr;
+	uint protocol;
+
+	if (ip_hdr(skb)->version == 4) {
+		nexthdr = (void *)(ip_hdr(skb) + 1);
+		protocol = ip_hdr(skb)->protocol;
+	} else {
+		nexthdr = (void *)(ipv6_hdr(skb) + 1);
+		protocol = ipv6_hdr(skb)->nexthdr;
+	}
 
 	if (protocol == IPPROTO_ICMP)
-		return ntohs(((struct icmphdr *)((struct iphdr *)skb->data + 1))
-				     ->un.echo.sequence);
+		return ntohs(((struct icmphdr *)nexthdr)->un.echo.sequence);
+	else if (protocol == IPPROTO_ICMPV6)
+		return ntohs(((struct icmp6hdr *)nexthdr)->icmp6_sequence);
 	else if (protocol == IPPROTO_TCP)
-		return ntohl(
-			((struct tcphdr *)((struct iphdr *)skb->data + 1))->seq);
+		return ntohl(((struct tcphdr *)nexthdr)->seq);
 	else if (protocol == IPPROTO_UDP)
-		return ntohs(((struct udphdr *)((struct iphdr *)skb->data + 1))
-				     ->source);
+		return ntohs(((struct udphdr *)nexthdr)->source);
 	else
 		return 0;
 }
@@ -370,13 +381,15 @@ static struct sk_buff *iptfs_alloc_skb(struct sk_buff *tpl, uint len)
 	if (resv < XFRM_IPTFS_MIN_HEADROOM)
 		resv = XFRM_IPTFS_MIN_HEADROOM;
 
-	pr_devinf("len %u resv %u\n", len, resv);
 	skb = alloc_skb(len + resv, GFP_ATOMIC);
 	if (!skb) {
 		XFRM_INC_STATS(dev_net(skb->dev), LINUX_MIB_XFRMINERROR);
-		pr_err_ratelimited("failed to alloc skb\n");
+		pr_err_ratelimited("failed to alloc skb resv %u\n", len + resv);
 		return NULL;
 	}
+
+	pr_devinf("len %u resv %u skb %p\n", len, resv, skb);
+
 	skb_reserve(skb, resv);
 	skb_copy_header(skb, tpl);
 
@@ -445,7 +458,8 @@ static uint __iptfs_iplen(u8 *data)
 	if (iph->version == 0x4)
 		return ntohs(iph->tot_len);
 	BUG_ON(iph->version != 0x6);
-	return ntohs(((struct ipv6hdr *)iph)->payload_len) + sizeof(struct ipv6hdr);
+	return ntohs(((struct ipv6hdr *)iph)->payload_len) +
+	       sizeof(struct ipv6hdr);
 }
 
 static uint __iptfs_iphdrlen(u8 *data)
@@ -493,8 +507,9 @@ static int iptfs_complete_inner_skb(struct xfrm_state *x, struct sk_buff *skb,
 	} else {
 		struct ipv6hdr *iph = ipv6_hdr(skb);
 
-		pr_devinf("completing inner, iplen %u skb len %u iphlen %u\n",
-			  ntohs(ipv6_hdr(skb)->payload_len), skb->len, iphlen);
+		pr_devinf(
+			"completing inner, payload len %u skb len %u iphlen %u\n",
+			ntohs(ipv6_hdr(skb)->payload_len), skb->len, iphlen);
 
 		family = AF_INET6;
 		if (x->props.flags & XFRM_STATE_DECAP_DSCP)
@@ -523,7 +538,7 @@ static int iptfs_complete_inner_skb(struct xfrm_state *x, struct sk_buff *skb,
 	if (sp)
 		sp->olen = 0;
 
-	/* XXX ok to do this on first_skb before done? */
+		/* XXX ok to do this on first_skb before done? */
 #if 0 // in master..
 	if (skb_valid_dst(skb))
 		skb_dst_drop(skb);
@@ -576,8 +591,9 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 		 * We are reassembling but this is an old sequence number.
 		 */
 		XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_OLD_SEQ);
-		pr_devinf("newer seq %llu expecting %llu newskb %lx runtlen %u\n", seq,
-			  xtfs->ra_wantseq, (ulong)newskb, xtfs->ra_runtlen);
+		pr_devinf(
+			"newer seq %llu expecting %llu newskb %lx runtlen %u\n",
+			seq, xtfs->ra_wantseq, (ulong)newskb, xtfs->ra_runtlen);
 		/* will end parsing */
 		return data + remaining;
 	}
