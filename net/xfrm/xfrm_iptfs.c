@@ -26,10 +26,10 @@
 /* #define IPTFS_ENET_OHEAD (14 + 4 + 8 + 12) */
 /* #define GE_PPS(ge, iptfs_ip_mtu) ((1e8 * 10 ^ (ge - 1) / 8) / (iptfs_ip_mtu)) */
 
-#undef PR_DEBUG_INFO
-#undef PR_DEBUG_STATE
-#undef PR_DEBUG_INGRESS
-#undef PR_DEBUG_EGRESS
+#define PR_DEBUG_INFO
+#define PR_DEBUG_STATE
+#define PR_DEBUG_INGRESS
+#define PR_DEBUG_EGRESS
 
 #ifdef PR_DEBUG_INFO
 #define _pr_devinf(...) pr_info(__VA_ARGS__)
@@ -123,6 +123,7 @@ static inline u64 __esp_seq(struct sk_buff *skb)
 	// return seq | (u64)ntohl(XFRM_SKB_CB(skb)->seq.input.hi) << 32;
 }
 
+#if 0
 void xfrm_iptfs_get_rtt_and_delays(struct ip_iptfs_cc_hdr *cch, u32 *rtt,
 				   u32 *actual_delay, u32 *xmit_delay)
 {
@@ -140,6 +141,7 @@ void xfrm_iptfs_get_rtt_and_delays(struct ip_iptfs_cc_hdr *cch, u32 *rtt,
 		      (cch->adelay2_and_xdelay[2] << 8) |
 		      cch->adelay2_and_xdelay[3];
 }
+#endif
 
 /* ========================== */
 /* State Management Functions */
@@ -278,6 +280,7 @@ int xfrm_iptfs_copy_to_user_state(struct xfrm_state *x, struct sk_buff *skb)
 #define pr_devinf(...)
 #endif
 
+#if 0
 struct sk_buff *skb_at_offset(struct sk_buff *skb, uint offset, uint len)
 {
 	if (offset >= skb->len)
@@ -315,6 +318,7 @@ struct sk_buff *skb_clone_data_range(struct sk_buff *skb, uint offset, uint len)
 	/* XXX chopps: unfinished */
 	return skb;
 }
+#endif
 
 int skb_copy_bits_seq(struct skb_seq_state *st, int offset, void *to, int len)
 {
@@ -567,13 +571,13 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 	 * insertion) be careful to handle that case in each of the below
 	 */
 
-	if (xtfs->ra_wantseq < seq) {
+	if ((newskb || xtfs->ra_runtlen) && xtfs->ra_wantseq < seq) {
 		/*
 		 * We are reassembling but this is an old sequence number.
 		 */
 		XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_OLD_SEQ);
-		pr_devinf("newer seq %llu expecting %llu\n", seq,
-			  xtfs->ra_wantseq);
+		pr_devinf("newer seq %llu expecting %llu newskb %lx runtlen %u\n", seq,
+			  xtfs->ra_wantseq, (ulong)newskb, xtfs->ra_runtlen);
 		/* will end parsing */
 		return data + remaining;
 	}
