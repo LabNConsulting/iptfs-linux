@@ -176,6 +176,8 @@ int xfrm_iptfs_init_state(struct xfrm_state *x)
 	if (!xtfs)
 		return -ENOMEM;
 
+	pr_devinf("init %p\n", xtfs);
+
 	xtfs->x = x;
 	xtfs->cfg.reorder_win_size = XFRM_IPTFS_DEFAULT_REORDER_WINDOW;
 	xtfs->cfg.max_queue_size = XFRM_IPTFS_DEFAULT_MAX_QUEUE_SIZE;
@@ -198,6 +200,9 @@ int xfrm_iptfs_init_state(struct xfrm_state *x)
 void xfrm_iptfs_state_destroy(struct xfrm_state *x)
 {
 	struct xfrm_iptfs_data *xtfs = x->tfs_data;
+
+	pr_devinf("destroy %p\n", xtfs);
+
 	if (IS_ERR_OR_NULL(xtfs))
 		return;
 
@@ -214,6 +219,8 @@ int xfrm_iptfs_user_init(struct net *net, struct xfrm_state *x,
 {
 	struct xfrm_iptfs_data *xtfs = x->tfs_data;
 	struct xfrm_iptfs_config *xc;
+
+	pr_devinf("user_init %p\n", xtfs);
 
 	if (x->props.mode != XFRM_MODE_IPTFS)
 		return EINVAL;
@@ -264,6 +271,8 @@ int xfrm_iptfs_copy_to_user_state(struct xfrm_state *x, struct sk_buff *skb)
 {
 	struct xfrm_iptfs_config *xc = &x->tfs_data->cfg;
 	int ret;
+
+	pr_devinf("copy state to user %p\n", x->tfs_data);
 
 	if (xc->dont_frag) {
 		if ((ret = nla_put_flag(skb, XFRMA_IPTFS_DONT_FRAG)))
@@ -824,7 +833,7 @@ static int iptfs_input_ordered(struct gro_cells *gro_cells,
 	INIT_LIST_HEAD(&sublist);
 
 	/*
-	 * Handle fragment at start of payload / reassembly.
+	 * Handle fragment at start of payload, and/or waiting reassembly.
 	 */
 
 	blkoff = ntohs(ipth->block_offset);
@@ -1821,7 +1830,7 @@ static int iptfs_xfrm_output(struct sk_buff *skb, uint remaining)
 		  skb->len, remaining);
 	err = xfrm_output(NULL, skb);
 	if (err < 0)
-		printk("XXX got xfrm_output error: %d", err);
+		pr_warn_ratelimited("xfrm_output error: %d", err);
 	return err;
 }
 
