@@ -595,32 +595,74 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 {
 	struct sk_buff *newskb = xtfs->ra_newskb;
 	uint remaining = skb->len - data;
-	uint copylen, fraglen, ipremain;
-	uint rlen, rrem;
+#ifdef PR_DEBUG_INGRESS
+	u64 want = xtfs->ra_wantseq;
+#endif
+	uint runtlen = xtfs->ra_runtlen;
+	uint copylen, fraglen, ipremain, rrem;
+
+	pr_devinf(
+		"got seq %llu blkoff %u plen %u want %llu skb %p runtlen %u\n",
+		seq, blkoff, remaining, want, xtfs->ra_newskb, runtlen);
 
 	/*
+	 * Handle packet fragment we aren't expecting
+	 */
+	if (!runtlen && !xtfs->ra_newskb) {
+		pr_devinf("not reassembling, skip fragment\n");
+		return data + min(blkoff, remaining);
+	}
+
+	/*
+	 * Important to remember that input to this function is an ordered
+	 * packet stream (unless the user disabled the reorder window). Thus if
+	 * we are waiting for, and expecting the next packet so we can continue
+	 * assembly. A newer sequence number indicates older ones are not coming
+	 * (or if they do should be ignored). Technically we can receive older
+	 * ones when the reorder window is disabled; however, the user should
+	 * have disabled fragmentation in this case, and regardless we don't
+	 * deal with it.
+	 *
 	 * blkoff could be zero if the stream is messed up (or it's an all pad
 	 * insertion) be careful to handle that case in each of the below
 	 */
 
-	if ((newskb || xtfs->ra_runtlen) && xtfs->ra_wantseq < seq) {
-		/*
-		 * We are reassembling but this is an old sequence number.
-		 */
+	/*
+	 * Too old case: This can happen when the reorder window is disabled so
+	 * ordering isn't actually guaranteed.
+	 */
+	if (seq < xtfs->ra_wantseq) {
 		XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_OLD_SEQ);
-		pr_devinf(
-			"newer seq %llu expecting %llu newskb %lx runtlen %u\n",
-			seq, xtfs->ra_wantseq, (ulong)newskb, xtfs->ra_runtlen);
-		/* will end parsing */
+		pr_devinf("dropping old seq\n");
 		return data + remaining;
 	}
 
 	/*
-	 * Handle all pad case, advance expected sequence number.
-	 * RFC XXXX S2.2.3
+	 * Too new case: We missed what we wanted cleanup.
 	 */
-	if (xtfs->ra_wantseq == seq && blkoff == 0 &&
-	    (*skb->data & 0xF0) == 0) {
+	if (seq > xtfs->ra_wantseq) {
+		pr_devinf("missed needed seq\n");
+		XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_MISSED_FRAG_START);
+	abandon:
+		if (xtfs->ra_newskb)
+			iptfs_reassem_abort(xtfs);
+		else {
+			xtfs->ra_runtlen = 0;
+			xtfs->ra_wantseq = 0;
+		}
+		/* skip past fragment, maybe to end */
+		return data + min(blkoff, remaining);
+	}
+
+	if (blkoff == 0) {
+		if ((*skb->data & 0xF0) != 0) {
+			pr_devinf("missing expected fragment\n");
+			goto abandon;
+		}
+		/*
+		 * Handle all pad case, advance expected sequence number.
+		 * (RFC 9347 S2.2.3)
+		 */
 		XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_ALL_PAD_SKIP);
 		pr_devinf("skipping all pad seq %llu \n", seq);
 		xtfs->ra_wantseq++;
@@ -628,83 +670,65 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 		return data + remaining;
 	}
 
-	rlen = xtfs->ra_runtlen;
-	xtfs->ra_runtlen = 0;
-	if (rlen && xtfs->ra_wantseq == seq) {
-		/* We have run data and expected next sequence we should never
-		 * have allocated a skb yet.
-		 */
+	if (runtlen) {
 		BUG_ON(xtfs->ra_newskb);
-		pr_devinf("have runt data len %u\n", rlen);
+
+		/* Regardless of what happens we're done with the runt */
+		xtfs->ra_runtlen = 0;
+
 		/*
 		 * The start of this inner packet was at the very end of the last
 		 * iptfs payload which didn't include enough for the ip header
 		 * length field. We must have *at least* that now.
 		 */
-		rrem = sizeof(xtfs->ra_runt) - rlen;
+		rrem = sizeof(xtfs->ra_runt) - runtlen;
 		if (remaining < rrem || blkoff < rrem) {
 			XFRM_INC_STATS(dev_net(skb->dev),
 				       LINUX_MIB_XFRMINBUFFERERROR);
 			pr_err_ratelimited(
-				"bad recv after runt: blkoff/remain %u/%u < runtrem %u\n",
+				"bad frag after runt: blkoff/remain %u/%u < runtrem %u\n",
 				blkoff, remaining, rrem);
-			/* will continue on to new data block or end */
-			return data + min(blkoff, remaining);
+			goto abandon;
 		}
+
 		/* fill in the runt data */
-		if (skb_copy_bits_seq(st, data, &xtfs->ra_runt[rlen], rrem)) {
-			/* this would be a ridiculous situation, end parsing */
-			return data + remaining;
-		}
-		/* we have enough data to get the ip length value now */
+		if (skb_copy_bits_seq(st, data, &xtfs->ra_runt[runtlen], rrem))
+			goto abandon;
+		/*
+		 * We have enough data to get the ip length value now,
+		 * allocate an in progress skb
+		 */
 		ipremain = __iptfs_iplen(xtfs->ra_runt);
+		if (ipremain < sizeof(xtfs->ra_runt)) {
+			/* length has to be at least runtsize large */
+			XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_BAD_IPLEN);
+			pr_devinf("bogus ip length %d\n", ipremain);
+			goto abandon;
+		}
+
 		newskb = iptfs_alloc_skb(skb, ipremain);
 		if (!newskb)
-			return data + min(blkoff, remaining);
+			goto abandon;
 		xtfs->ra_newskb = newskb;
+
 		/*
 		 * Copy the runt data into the buffer, but leave data
-		 * pointers the same as normal non-runt entry. The extra `rrem`
-		 * recopied bytes are basically cacheline free. Using a single
-		 * data pointer logic below avoids a lot of complexity.
+		 * pointers the same as normal non-runt case. The extra `rrem`
+		 * recopied bytes are basically cacheline free. Allows using
+		 * same logic below to complete.
 		 */
-		memcpy(skb_put(newskb, rlen), xtfs->ra_runt,
+		memcpy(skb_put(newskb, runtlen), xtfs->ra_runt,
 		       sizeof(xtfs->ra_runt));
 	}
 
-	if (!newskb || xtfs->ra_wantseq > seq) {
-		/*
-		 * We are not reassembling or this is not the sequence
-		 * number we are expecting. Skip the partial inner
-		 * packet fragment at the start of this outer packet.
-		 */
-		XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_MISSED_FRAG_START);
-		if (!newskb) {
-			pr_devinf(
-				"block offset: %u (or runt %u) but not reassembling\n",
-				blkoff, rlen);
-		} else {
-			pr_devinf(
-				"missed frag seq, want: %llu got: %llu, skipping over frag %u\n",
-				xtfs->ra_wantseq, seq, blkoff);
-			/* drop unfinished packet reassembly */
-			iptfs_reassem_abort(xtfs);
-		}
-		if (blkoff >= remaining) {
-			pr_devinf("skipping entire fragment payload\n");
-			/* will end parsing */
-			return data + remaining;
-		}
-
-		/* will continue on to new data block */
-		pr_devinf("skipping to next fragment blkoff/remain %u/%u\n",
-			  blkoff, remaining);
-		return data + blkoff;
-	}
-
-	/* Continue to reassemble the packet */
+	/*
+	 * Continue reassembling the packet
+	 */
 	ipremain = __iptfs_iplen(newskb->data);
+
+	/* we created the newskb knowing the length it can't now be shorter */
 	BUG_ON(newskb->len > ipremain);
+
 	ipremain -= newskb->len;
 	if (blkoff < ipremain) {
 		/* Corrupt data, we don't have enough to complete the packet */
@@ -712,44 +736,37 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 		pr_err_ratelimited(
 			"bad recv blkoff: blkoff %u < ip remaining %u\n",
 			blkoff, ipremain);
-		iptfs_reassem_abort(xtfs);
-		/* will end parsing */
-		return data + remaining;
+		goto abandon;
 	}
 
 	fraglen = min(blkoff, remaining);
 	copylen = min(fraglen, ipremain);
 	BUG_ON(skb_tailroom(newskb) < copylen);
 
-	pr_devinf(
-		"continue to reassem, ipremain %u blkoff %u remain %u fraglen %u copylen %u\n",
-		ipremain, blkoff, remaining, fraglen, copylen);
+	pr_devinf("continue, iprem %u copylen %u\n", ipremain, copylen);
 
 	/* copy fragment data into newskb */
 	if (skb_copy_bits_seq(st, data, skb_put(newskb, copylen), copylen)) {
-		pr_err_ratelimited("bad skb\n");
 		XFRM_INC_STATS(dev_net(skb->dev), LINUX_MIB_XFRMINBUFFERERROR);
-		iptfs_reassem_abort(xtfs);
-		/* will end parsing */
-		return data + remaining;
+		pr_err_ratelimited("bad skb\n");
+		goto abandon;
 	}
 
 	if (copylen < ipremain) {
 		xtfs->ra_wantseq++;
-		pr_devinf("packet unfinished, inc exp seq to %llu\n",
+		pr_devinf("unfinished, incr expected to %llu\n",
 			  xtfs->ra_wantseq);
 	} else {
 		/* We are done with packet reassembly! */
 		BUG_ON(copylen != ipremain);
 		iptfs_reassem_done(xtfs);
-		pr_devinf("packet finished, %u left in payload\n",
+		pr_devinf("finished, %u left in payload\n",
 			  remaining - copylen);
 		if (iptfs_complete_inner_skb(xtfs->x, newskb,
-					     __iptfs_iphdrlen(newskb->data))) {
+					     __iptfs_iphdrlen(newskb->data)))
 			kfree_skb(newskb);
-		} else {
+		else
 			list_add_tail(&newskb->list, list);
-		}
 	}
 
 	/* will continue on to new data block or end */
