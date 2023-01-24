@@ -200,7 +200,11 @@ void xfrm_iptfs_state_destroy(struct xfrm_state *x)
 	struct xfrm_iptfs_data *xtfs = x->tfs_data;
 	if (IS_ERR_OR_NULL(xtfs))
 		return;
+
+	spin_lock(&xtfs->drop_lock);
 	hrtimer_cancel(&xtfs->iptfs_timer);
+	hrtimer_cancel(&xtfs->drop_timer);
+	spin_unlock(&xtfs->drop_lock);
 	kfree_sensitive(xtfs->w_saved);
 	kfree_sensitive(xtfs);
 }
