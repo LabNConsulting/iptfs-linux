@@ -24,6 +24,8 @@ static int __xfrm4_output(struct net *net, struct sock *sk, struct sk_buff *skb)
 		return dst_output(net, sk, skb);
 	}
 #endif
+	if (x->props.mode == XFRM_MODE_IPTFS)
+                return xfrm_iptfs_output_collect(skb, sk);
 
 	return xfrm_output(sk, skb);
 }

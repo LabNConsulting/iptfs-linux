@@ -269,7 +269,8 @@ static int xfrm4_beet_encap_add(struct xfrm_state *x, struct sk_buff *skb)
  *
  * The top IP header will be constructed per RFC 2401.
  */
-static int xfrm4_tunnel_encap_add(struct xfrm_state *x, struct sk_buff *skb)
+static int __xfrm4_tunnel_encap_add(struct xfrm_state *x, struct sk_buff *skb,
+				    u8 ipproto, u8 hdradj)
 {
 	bool small_ipv6 = (skb->protocol == htons(ETH_P_IPV6)) && (skb->len <= IPV6_MIN_MTU);
 	struct dst_entry *dst = skb_dst(skb);
@@ -279,7 +280,7 @@ static int xfrm4_tunnel_encap_add(struct xfrm_state *x, struct sk_buff *skb)
 	skb_set_inner_network_header(skb, skb_network_offset(skb));
 	skb_set_inner_transport_header(skb, skb_transport_offset(skb));
 
-	skb_set_network_header(skb, -x->props.header_len);
+	skb_set_network_header(skb, -(x->props.header_len - hdradj));
 	skb->mac_header = skb->network_header +
 			  offsetof(struct iphdr, protocol);
 	skb->transport_header = skb->network_header + sizeof(*top_iph);
@@ -288,7 +289,7 @@ static int xfrm4_tunnel_encap_add(struct xfrm_state *x, struct sk_buff *skb)
 	top_iph->ihl = 5;
 	top_iph->version = 4;
 
-	top_iph->protocol = xfrm_af2proto(skb_dst(skb)->ops->family);
+	top_iph->protocol = ipproto;
 
 	/* DS disclosing depends on XFRM_SA_XFLAG_DONT_ENCAP_DSCP */
 	if (x->props.extra_flags & XFRM_SA_XFLAG_DONT_ENCAP_DSCP)
@@ -314,8 +315,15 @@ static int xfrm4_tunnel_encap_add(struct xfrm_state *x, struct sk_buff *skb)
 	return 0;
 }
 
+static int xfrm4_tunnel_encap_add(struct xfrm_state *x, struct sk_buff *skb)
+{
+	u8 ipproto = xfrm_af2proto(skb_dst(skb)->ops->family);
+	return __xfrm4_tunnel_encap_add(x, skb, ipproto, 0);
+}
+
 #if IS_ENABLED(CONFIG_IPV6)
-static int xfrm6_tunnel_encap_add(struct xfrm_state *x, struct sk_buff *skb)
+static int __xfrm6_tunnel_encap_add(struct xfrm_state *x, struct sk_buff *skb,
+				    u8 nexthdr, u8 hdradj)
 {
 	struct dst_entry *dst = skb_dst(skb);
 	struct ipv6hdr *top_iph;
@@ -324,7 +332,7 @@ static int xfrm6_tunnel_encap_add(struct xfrm_state *x, struct sk_buff *skb)
 	skb_set_inner_network_header(skb, skb_network_offset(skb));
 	skb_set_inner_transport_header(skb, skb_transport_offset(skb));
 
-	skb_set_network_header(skb, -x->props.header_len);
+	skb_set_network_header(skb, -(x->props.header_len - hdradj));
 	skb->mac_header = skb->network_header +
 			  offsetof(struct ipv6hdr, nexthdr);
 	skb->transport_header = skb->network_header + sizeof(*top_iph);
@@ -334,7 +342,7 @@ static int xfrm6_tunnel_encap_add(struct xfrm_state *x, struct sk_buff *skb)
 
 	memcpy(top_iph->flow_lbl, XFRM_MODE_SKB_CB(skb)->flow_lbl,
 	       sizeof(top_iph->flow_lbl));
-	top_iph->nexthdr = xfrm_af2proto(skb_dst(skb)->ops->family);
+	top_iph->nexthdr = nexthdr;
 
 	if (x->props.extra_flags & XFRM_SA_XFLAG_DONT_ENCAP_DSCP)
 		dsfield = 0;
@@ -348,6 +356,12 @@ static int xfrm6_tunnel_encap_add(struct xfrm_state *x, struct sk_buff *skb)
 	top_iph->saddr = *(struct in6_addr *)&x->props.saddr;
 	top_iph->daddr = *(struct in6_addr *)&x->id.daddr;
 	return 0;
+}
+
+static int xfrm6_tunnel_encap_add(struct xfrm_state *x, struct sk_buff *skb)
+{
+	u8 nexthdr = xfrm_af2proto(skb_dst(skb)->ops->family);
+	return __xfrm6_tunnel_encap_add(x, skb, nexthdr, 0);
 }
 
 static int xfrm6_beet_encap_add(struct xfrm_state *x, struct sk_buff *skb)
@@ -449,6 +463,27 @@ static int xfrm6_prepare_output(struct xfrm_state *x, struct sk_buff *skb)
 	return -EAFNOSUPPORT;
 }
 
+static int xfrm_prepare_iptfs_output(struct xfrm_state *x, struct sk_buff *skb)
+{
+#if IS_ENABLED(CONFIG_XFRM_IPTFS)
+	/* XXX actually get this from the sub-type CC or non-CC mode */
+	size_t hsz = sizeof(struct ip_iptfs_hdr);
+
+	if (x->outer_mode.family == AF_INET)
+		return __xfrm4_tunnel_encap_add(x, skb, XFRM_PROTO_IPTFS, hsz);
+	else if (x->outer_mode.family == AF_INET6) {
+#if IS_ENABLED(CONFIG_IPV6)
+		return __xfrm6_tunnel_encap_add(x, skb, XFRM_PROTO_IPTFS, hsz);
+#else
+		WARN_ON_ONCE(1);
+		return -EAFNOSUPPORT;
+#endif
+	}
+#endif
+	WARN_ON_ONCE(1);
+	return -EOPNOTSUPP;
+}
+
 static int xfrm_outer_mode_output(struct xfrm_state *x, struct sk_buff *skb)
 {
 	switch (x->props.mode) {
@@ -459,6 +494,8 @@ static int xfrm_outer_mode_output(struct xfrm_state *x, struct sk_buff *skb)
 		if (x->props.family == AF_INET6)
 			return xfrm6_prepare_output(x, skb);
 		break;
+	case XFRM_MODE_IPTFS:
+		return xfrm_prepare_iptfs_output(x, skb);
 	case XFRM_MODE_TRANSPORT:
 		if (x->props.family == AF_INET)
 			return xfrm4_transport_output(x, skb);
@@ -674,6 +711,10 @@ static void xfrm_get_inner_ipproto(struct sk_buff *skb, struct xfrm_state *x)
 
 		return;
 	}
+	if (x->outer_mode.encap == XFRM_MODE_IPTFS) {
+		xo->inner_ipproto = IPPROTO_AGGFRAG;
+		return;
+	}
 
 	/* non-Tunnel Mode */
 	if (!skb->encapsulation)
@@ -704,6 +745,8 @@ int xfrm_output(struct sock *sk, struct sk_buff *skb)
 	struct net *net = dev_net(skb_dst(skb)->dev);
 	struct xfrm_state *x = skb_dst(skb)->xfrm;
 	int err;
+
+	/* XXX chopps: is here a good place to queue iptfs? */
 
 	switch (x->outer_mode.family) {
 	case AF_INET:
