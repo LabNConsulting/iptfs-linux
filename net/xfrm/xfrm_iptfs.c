@@ -344,6 +344,19 @@ struct sk_buff *skb_clone_data_range(struct sk_buff *skb, uint offset, uint len)
 }
 #endif
 
+/**
+ * skb_copy_bits_seq - copy bits from a skb_seq_state to kernel buffer
+ * @st: source skb_seq_state
+ * @offset: offset in source
+ * @to: destination buffer
+ * @len: number of bytes to copy
+ *
+ * Copy @len bytes from @offset bytes into the the source @st to the destination
+ * buffer @to.
+ *
+ * TODO: this is generically named with the belief that this function belongs
+ * along with theu other skb_..._seq functions.
+ */
 int skb_copy_bits_seq(struct skb_seq_state *st, int offset, void *to, int len)
 {
 	const u8 *data;
@@ -406,7 +419,7 @@ static struct sk_buff *iptfs_alloc_skb(struct sk_buff *tpl, uint len)
 	skb_reserve(skb, resv);
 	skb_copy_header(skb, tpl);
 
-	// Let's not copy the checksum!
+	/* Let's not copy the checksum */
 	skb->csum = 0;
 	skb->ip_summed = CHECKSUM_NONE;
 
@@ -420,7 +433,7 @@ static struct sk_buff *iptfs_alloc_skb(struct sk_buff *tpl, uint len)
 }
 
 /**
- * iptfs_pskb_extract_seq() - Create and load data into a new sk_buff, `skb`.
+ * iptfs_pskb_extract_seq() - Create and load data into a new sk_buff.
  * @skblen: the total data size for `skb`.
  * @resv: the amount of space to reserve for headers.
  * @st: The source for the rest of the data to copy into `skb`.
@@ -428,7 +441,7 @@ static struct sk_buff *iptfs_alloc_skb(struct sk_buff *tpl, uint len)
  * @len: The length of data to copy from @st into `skb`. This must be <=
  *       @skblen.
  *
- * Create a new sk_buff `skb` with @totlen of packet data space plus @resv
+ * Create a new sk_buff `skb` with @skblen of packet data space plus @resv
  * reserved headroom. If non-zero, copy @rlen bytes of @runt into `skb`. Then
  * using seq functions copy @len bytes from @st into `skb` starting from @off.
  *
@@ -617,7 +630,7 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 	 * Important to remember that input to this function is an ordered
 	 * packet stream (unless the user disabled the reorder window). Thus if
 	 * we are waiting for, and expecting the next packet so we can continue
-	 * assembly. A newer sequence number indicates older ones are not coming
+	 * assembly, a newer sequence number indicates older ones are not coming
 	 * (or if they do should be ignored). Technically we can receive older
 	 * ones when the reorder window is disabled; however, the user should
 	 * have disabled fragmentation in this case, and regardless we don't
@@ -2052,35 +2065,17 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 	struct sk_buff *skb, *skb2, *nskb, **nextp;
 	uint blkoff;
 
-	/*
-	 * When we do timed output things (locking) will be more complex in the
-	 * presence of fragmentation. But maybe more efficient since there
-	 * shouldn't be any contention due to the pacing timer being regularly
-	 * spaced.
-	 */
-
-	/*
-	 * For now we are just outputting packets as fast as we can, so if we
-	 * are fragmenting we will do so until the last inner packet is complete,
-	 * Then we just send the last packet padded -- or perhaps check if this
-	 * callback's timer has been reset and is sufficiently soon we can
-	 * save this final packet to be used by the next timer fire.
+	/* For now we are just outputting packets as fast as we can, so if we
+	 * are fragmenting we will do so until the last inner packet has been
+	 * consumed.
 	 *
-	 * We do not need to lock the put-back packet as we only manipulate this
-	 * field in this function.
-	 *
-	 * The case is exactly the same when not fragmenting, we either send the
-	 * last outer packet padded or delay for a soon to fire reset timer.
-	 */
-
-	/*
-	 * When we do timed packets *and* fragmentation we need to output all packets that contain
-	 * the fragments of a single inner packet, consecutively. So we have to
-	 * have a lock to keep another CPU from grabbing the next batch of
-	 * packets (it's `list`) and trying to output those, while we try to
-	 * output our `list`. IOW there can only be one cpu outputting packets
-	 * for a given SA at a given time. Thus we need to lock the IPTFS output
-	 * on a per SA basis while we process this list.
+	 * When we are fragmenting we need to output all outer packets that
+	 * contain the fragments of a single inner packet, consecutively (ESP
+	 * seq-wise). So we need a lock to keep another CPU from sending the
+	 * next batch of packets (it's `list`) and trying to output those, while
+	 * we output our `list` resuling with interleaved non-spec-client inner
+	 * packet streams. Thus we need to lock the IPTFS output on a per SA
+	 * basis while we process this list.
 	 */
 
 	/*
