@@ -156,7 +156,7 @@ jobs:
           repository: LabNConsulting/iptfs-dev
 
       - name: Checkout buildroot source repository
-        run: git clone --depth 1 git://git.buildroot.net/buildroot buildroot -b 2022.08
+        run: git clone --depth 1 git://git.buildroot.net/buildroot buildroot -b 2023.05
 
       - name: Checkout iproute2 repository
         uses: actions/checkout@v3
