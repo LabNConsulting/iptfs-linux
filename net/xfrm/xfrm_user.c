@@ -780,6 +780,12 @@ static struct xfrm_state *xfrm_state_construct(struct net *net,
 			goto error;
 	}
 
+#if IS_ENABLED(CONFIG_XFRM_IPTFS)
+	if (x->props.mode == XFRM_MODE_IPTFS)
+		err = xfrm_iptfs_user_init(net, x, attrs);
+	if (err)
+		goto error;
+#endif
 	return x;
 
 error:
