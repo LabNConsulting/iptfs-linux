@@ -779,6 +779,12 @@ static struct xfrm_state *xfrm_state_construct(struct net *net,
 			goto error;
 	}
 
+#if IS_ENABLED(CONFIG_XFRM_IPTFS)
+	if (x->props.mode == XFRM_MODE_IPTFS)
+		err = xfrm_iptfs_user_init(net, x, attrs);
+	if (err)
+		goto error;
+#endif
 	return x;
 
 error:
@@ -1192,6 +1198,12 @@ static int copy_to_user_state_extra(struct xfrm_state *x,
 		if (ret)
 			goto out;
 	}
+#if IS_ENABLED(CONFIG_XFRM_IPTFS)
+	if (x->props.mode == XFRM_MODE_IPTFS)
+		ret = xfrm_iptfs_copy_to_user_state(x, skb);
+	if (ret)
+		goto out;
+#endif
 	if (x->mapping_maxage)
 		ret = nla_put_u32(skb, XFRMA_MTIMER_THRESH, x->mapping_maxage);
 out:
