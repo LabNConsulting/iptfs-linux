@@ -63,6 +63,23 @@ static void __xfrm_mode_beet_prep(struct xfrm_state *x, struct sk_buff *skb,
 	pskb_pull(skb, skb->mac_len + hsize + (x->props.header_len - phlen));
 }
 
+static void __xfrm_mode_iptfs_prep(struct xfrm_state *x, struct sk_buff *skb,
+				   unsigned int hsize)
+
+{
+	struct xfrm_offload *xo = xfrm_offload(skb);
+
+	if (xo->flags & XFRM_GSO_SEGMENT)
+		skb->transport_header = skb->network_header + hsize;
+
+	skb_reset_mac_len(skb);
+	/*
+	 * header_len includes the IPTFS header which needs to be encrypted
+	 * so we need to subtract it from where we pull up to.
+	 */
+	pskb_pull(skb, skb->mac_len + x->props.header_len - 4);
+}
+
 /* Adjust pointers into the packet when IPsec is done at layer2 */
 static void xfrm_outer_mode_prep(struct xfrm_state *x, struct sk_buff *skb)
 {
@@ -90,6 +107,14 @@ static void xfrm_outer_mode_prep(struct xfrm_state *x, struct sk_buff *skb)
 		if (x->outer_mode.family == AF_INET6)
 			return __xfrm_mode_beet_prep(x, skb,
 						     sizeof(struct ipv6hdr));
+		break;
+	case XFRM_MODE_IPTFS:
+		if (x->outer_mode.family == AF_INET)
+			return __xfrm_mode_iptfs_prep(x, skb,
+						      sizeof(struct iphdr));
+		if (x->outer_mode.family == AF_INET6)
+			return __xfrm_mode_iptfs_prep(x, skb,
+						      sizeof(struct ipv6hdr));
 		break;
 	case XFRM_MODE_ROUTEOPTIMIZATION:
 	case XFRM_MODE_IN_TRIGGER:

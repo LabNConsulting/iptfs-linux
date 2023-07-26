@@ -100,8 +100,7 @@ static const struct xfrm_input_afinfo *xfrm_input_get_afinfo(u8 family, bool is_
 	return afinfo;
 }
 
-static int xfrm_rcv_cb(struct sk_buff *skb, unsigned int family, u8 protocol,
-		       int err)
+int xfrm_rcv_cb(struct sk_buff *skb, unsigned int family, u8 protocol, int err)
 {
 	bool is_ipip = (protocol == IPPROTO_IPIP || protocol == IPPROTO_IPV6);
 	const struct xfrm_input_afinfo *afinfo;
@@ -116,6 +115,7 @@ static int xfrm_rcv_cb(struct sk_buff *skb, unsigned int family, u8 protocol,
 
 	return ret;
 }
+EXPORT_SYMBOL(xfrm_rcv_cb);
 
 struct sec_path *secpath_set(struct sk_buff *skb)
 {
@@ -339,6 +339,9 @@ xfrm_inner_mode_encap_remove(struct xfrm_state *x,
 			return xfrm6_remove_beet_encap(x, skb);
 		}
 		break;
+	case XFRM_MODE_IPTFS:
+		BUG_ON(x->inner_mode.encap == XFRM_MODE_IPTFS);
+		break;
 	case XFRM_MODE_TUNNEL:
 		switch (XFRM_MODE_SKB_CB(skb)->protocol) {
 		case IPPROTO_IPIP:
@@ -437,6 +440,9 @@ static int xfrm_inner_mode_input(struct xfrm_state *x,
 			return xfrm4_transport_input(x, skb);
 		if (x->props.family == AF_INET6)
 			return xfrm6_transport_input(x, skb);
+		break;
+	case XFRM_MODE_IPTFS:
+		BUG_ON(x->inner_mode.encap == XFRM_MODE_IPTFS);
 		break;
 	case XFRM_MODE_ROUTEOPTIMIZATION:
 		WARN_ON_ONCE(1);
@@ -666,6 +672,16 @@ resume:
 		spin_unlock(&x->lock);
 
 		XFRM_MODE_SKB_CB(skb)->protocol = nexthdr;
+
+		if (x->props.mode == XFRM_MODE_IPTFS) {
+#if IS_ENABLED(CONFIG_XFRM_IPTFS)
+			/* nexthdr == XFRM_PROTO_IPTFS */
+			return xfrm_iptfs_input(&gro_cells, x, skb);
+#else
+			XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEMODEERROR);
+			goto drop;
+#endif
+		}
 
 		if (xfrm_inner_mode_input(x, skb)) {
 			XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEMODEERROR);

@@ -1785,6 +1785,7 @@ int km_report(struct net *net, u8 proto, struct xfrm_selector *sel,
 
 void xfrm_input_init(void);
 int xfrm_parse_spi(struct sk_buff *skb, u8 nexthdr, __be32 *spi, __be32 *seq);
+int xfrm_rcv_cb(struct sk_buff *skb, unsigned int family, u8 protocol, int err);
 
 void xfrm_probe_algs(void);
 int xfrm_count_pfkey_auth_supported(void);
