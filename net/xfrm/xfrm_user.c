@@ -744,6 +744,7 @@ static struct xfrm_state *xfrm_state_construct(struct net *net,
 	if (attrs[XFRMA_IF_ID])
 		x->if_id = nla_get_u32(attrs[XFRMA_IF_ID]);
 
+	/* TODO: should we add option to load mode_cbs modules? */
 	err = __xfrm_init_state(x, false, attrs[XFRMA_OFFLOAD_DEV], extack);
 	if (err)
 		goto error;
@@ -775,6 +776,12 @@ static struct xfrm_state *xfrm_state_construct(struct net *net,
 		err = xfrm_dev_state_add(net, x,
 					 nla_data(attrs[XFRMA_OFFLOAD_DEV]),
 					 extack);
+		if (err)
+			goto error;
+	}
+
+	if (x->mode_cbs && x->mode_cbs->user_init) {
+		err = x->mode_cbs->user_init(net, x, attrs);
 		if (err)
 			goto error;
 	}
@@ -1192,6 +1199,10 @@ static int copy_to_user_state_extra(struct xfrm_state *x,
 		if (ret)
 			goto out;
 	}
+	if (x->mode_cbs && x->mode_cbs->copy_to_user)
+		ret = x->mode_cbs->copy_to_user(x, skb);
+	if (ret)
+		goto out;
 	if (x->mapping_maxage)
 		ret = nla_put_u32(skb, XFRMA_MTIMER_THRESH, x->mapping_maxage);
 out:
