@@ -290,7 +290,9 @@ static int xfrm4_tunnel_encap_add(struct xfrm_state *x, struct sk_buff *skb)
 	top_iph->ihl = 5;
 	top_iph->version = 4;
 
-	top_iph->protocol = xfrm_af2proto(skb_dst(skb)->ops->family);
+	top_iph->protocol = x->props.mode == XFRM_MODE_IPTFS ?
+				    IPPROTO_AGGFRAG :
+				    xfrm_af2proto(skb_dst(skb)->ops->family);
 
 	/* DS disclosing depends on XFRM_SA_XFLAG_DONT_ENCAP_DSCP */
 	if (x->props.extra_flags & XFRM_SA_XFLAG_DONT_ENCAP_DSCP)
@@ -337,7 +339,10 @@ static int xfrm6_tunnel_encap_add(struct xfrm_state *x, struct sk_buff *skb)
 
 	memcpy(top_iph->flow_lbl, XFRM_MODE_SKB_CB(skb)->flow_lbl,
 	       sizeof(top_iph->flow_lbl));
-	top_iph->nexthdr = xfrm_af2proto(skb_dst(skb)->ops->family);
+
+	top_iph->nexthdr = x->props.mode == XFRM_MODE_IPTFS ?
+				   IPPROTO_AGGFRAG :
+				   xfrm_af2proto(skb_dst(skb)->ops->family);
 
 	if (x->props.extra_flags & XFRM_SA_XFLAG_DONT_ENCAP_DSCP)
 		dsfield = 0;
@@ -418,6 +423,7 @@ static int xfrm4_prepare_output(struct xfrm_state *x, struct sk_buff *skb)
 	switch (x->props.mode) {
 	case XFRM_MODE_BEET:
 		return xfrm4_beet_encap_add(x, skb);
+	case XFRM_MODE_IPTFS:
 	case XFRM_MODE_TUNNEL:
 		return xfrm4_tunnel_encap_add(x, skb);
 	}
@@ -441,6 +447,7 @@ static int xfrm6_prepare_output(struct xfrm_state *x, struct sk_buff *skb)
 	switch (x->props.mode) {
 	case XFRM_MODE_BEET:
 		return xfrm6_beet_encap_add(x, skb);
+	case XFRM_MODE_IPTFS:
 	case XFRM_MODE_TUNNEL:
 		return xfrm6_tunnel_encap_add(x, skb);
 	default:
@@ -456,6 +463,7 @@ static int xfrm_outer_mode_output(struct xfrm_state *x, struct sk_buff *skb)
 {
 	switch (x->props.mode) {
 	case XFRM_MODE_BEET:
+	case XFRM_MODE_IPTFS:
 	case XFRM_MODE_TUNNEL:
 		if (x->props.family == AF_INET)
 			return xfrm4_prepare_output(x, skb);
