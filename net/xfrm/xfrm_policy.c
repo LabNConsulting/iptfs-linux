@@ -2690,13 +2690,17 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
 
 		dst1->input = dst_discard;
 
-		rcu_read_lock();
-		afinfo = xfrm_state_afinfo_get_rcu(inner_mode->family);
-		if (likely(afinfo))
-			dst1->output = afinfo->output;
-		else
-			dst1->output = dst_discard_out;
-		rcu_read_unlock();
+		if (xfrm[i]->mode_cbs && xfrm[i]->mode_cbs->output)
+			dst1->output = xfrm[i]->mode_cbs->output;
+		else {
+			rcu_read_lock();
+			afinfo = xfrm_state_afinfo_get_rcu(inner_mode->family);
+			if (likely(afinfo))
+				dst1->output = afinfo->output;
+			else
+				dst1->output = dst_discard_out;
+			rcu_read_unlock();
+		}
 
 		xdst_prev = xdst;
 
@@ -3858,15 +3862,19 @@ static void xfrm_init_pmtu(struct xfrm_dst **bundle, int nr)
 		u32 pmtu, route_mtu_cached;
 		struct dst_entry *dst;
 
+		/* Get the xfrm's dst MTU (i.e., interface/route). */
 		dst = &xdst->u.dst;
 		pmtu = dst_mtu(xfrm_dst_child(dst));
 		xdst->child_mtu_cached = pmtu;
 
+		/* Adjust this MTU down according to the xfrm mode. */
 		pmtu = xfrm_state_mtu(dst->xfrm, pmtu);
 
+		/* Get the inner traffic's route's MTU */
 		route_mtu_cached = dst_mtu(xdst->route);
 		xdst->route_mtu_cached = route_mtu_cached;
 
+		/* Adjust MTU to no larger than inner traffic route MTU. */
 		if (pmtu > route_mtu_cached)
 			pmtu = route_mtu_cached;
 
