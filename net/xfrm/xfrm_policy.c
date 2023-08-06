@@ -2692,7 +2692,7 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
 
 		dst1->input = dst_discard;
 
-		mode_cbs = xfrm_get_mode_cbs(xfrm[i]->props.mode);
+		mode_cbs = xfrm_get_mode_cbs(xfrm[i]->props.mode, false);
 		if (mode_cbs && mode_cbs->output)
 			dst1->output = mode_cbs->output;
 		else {

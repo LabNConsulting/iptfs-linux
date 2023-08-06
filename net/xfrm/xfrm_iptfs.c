@@ -330,8 +330,7 @@ static uint __iptfs_iplen(u8 *data)
  */
 static void iptfs_complete_inner_skb(struct xfrm_state *x, struct sk_buff *skb)
 {
-	struct sec_path *sp;
-	int err, family;
+	int family;
 
 	skb_reset_network_header(skb);
 
@@ -586,8 +585,7 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 /*
  * We have an IPTFS payload dispense with it and this skb as well.
  */
-static int iptfs_input_ordered(struct gro_cells *gro_cells,
-			       struct xfrm_state *x, struct sk_buff *skb)
+static int iptfs_input_ordered(struct xfrm_state *x, struct sk_buff *skb)
 {
 	u8 hbytes[sizeof(struct ipv6hdr)];
 	struct ip_iptfs_cc_hdr iptcch;
@@ -1431,7 +1429,7 @@ static enum hrtimer_restart iptfs_drop_timer(struct hrtimer *me)
 		pr_devinf("receiving ordered list of len %u\n", count);
 		list_for_each_entry_safe (skb, next, &list, list) {
 			skb_list_del_init(skb);
-			(void)iptfs_input_ordered(xfrm_input_gro_cells, x, skb);
+			(void)iptfs_input_ordered(x, skb);
 		}
 	}
 	return HRTIMER_NORESTART;
@@ -1440,8 +1438,7 @@ static enum hrtimer_restart iptfs_drop_timer(struct hrtimer *me)
 /*
  * We have an IPTFS payload order it if needed.
  */
-static int iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
-		     struct sk_buff *skb)
+static int iptfs_input(struct xfrm_state *x, struct sk_buff *skb)
 {
 	struct list_head freelist, list;
 	struct xfrm_iptfs_data *xtfs = x->mode_data;
@@ -1450,7 +1447,7 @@ static int iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 
 	/* Fast path for no reorder window. */
 	if (xtfs->cfg.reorder_win_size == 0) {
-		iptfs_input_ordered(gro_cells, x, skb);
+		iptfs_input_ordered(x, skb);
 		return 0;
 	}
 
@@ -1470,7 +1467,7 @@ static int iptfs_input(struct gro_cells *gro_cells, struct xfrm_state *x,
 		pr_devinf("receiving ordered list of len %u\n", count);
 		list_for_each_entry_safe (skb, next, &list, list) {
 			skb_list_del_init(skb);
-			(void)iptfs_input_ordered(gro_cells, x, skb);
+			(void)iptfs_input_ordered(x, skb);
 		}
 	}
 
@@ -2132,18 +2129,17 @@ static enum hrtimer_restart iptfs_delay_timer(struct hrtimer *me)
 	iptfs_output_queued(x, &list);
 
 	return HRTIMER_NORESTART;
-}_
+}
 
-_
 static void iptfs_xmit_prep(struct xfrm_state *x, struct sk_buff *skb)
 {
 	struct xfrm_offload *xo = xfrm_offload(skb);
 	uint hsize;
 
 	if (x->outer_mode.family == AF_INET)
-		hsize = sizeof(iphdr);
+		hsize = sizeof(struct iphdr);
 	else if (x->outer_mode.family == AF_INET6)
-		hsize = sizeof(ipv6hdr);
+		hsize = sizeof(struct ipv6hdr);
 	else
 		return;
 
@@ -2226,7 +2222,8 @@ static int iptfs_user_init(struct net *net, struct xfrm_state *x,
 
 static int iptfs_copy_to_user(struct xfrm_state *x, struct sk_buff *skb)
 {
-	struct xfrm_iptfs_config *xc = &x->mode_data->cfg;
+	struct xfrm_iptfs_data *xtfs = x->mode_data;
+	struct xfrm_iptfs_config *xc = &xtfs->cfg;
 	int ret;
 
 	pr_devinf("copy state to user %p\n", x->tfs_data);

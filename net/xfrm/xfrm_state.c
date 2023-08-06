@@ -523,22 +523,22 @@ static const struct xfrm_mode *xfrm_get_mode(unsigned int encap, int family)
 	return NULL;
 }
 
-static const struct xfrm_mode_cbs xfrm_mode_cbs_map[XFRM_MODE_MAX];
+static struct xfrm_mode_cbs xfrm_mode_cbs_map[XFRM_MODE_MAX];
 
-int xfrm_register_mode_cbs(const struct xfrm_mode_cbs *mode_cbs)
+int xfrm_register_mode_cbs(u8 mode, const struct xfrm_mode_cbs *mode_cbs)
 {
-	if (mode_cbs->mode >= XFRM_MODE_MAX)
+	if (mode >= XFRM_MODE_MAX)
 		return -EINVAL;
 
-	xfrm_mode_cbs[mode] = *mode_cbs;
+	xfrm_mode_cbs_map[mode] = *mode_cbs;
 	return 0;
 }
 
-void xfrm_unregister_mode_cbs(const struct xfrm_mode_cbs *mode_cbs)
+void xfrm_unregister_mode_cbs(u8 mode)
 {
-	if (mode_cbs->mode < XFRM_MODE_MAX)
-		memset(&xfrm_mode_cbs_valid[mode], 0,
-		       sizeof(xfrm_mode_cbs_valid[mode]);
+	if (mode < XFRM_MODE_MAX)
+		memset(&xfrm_mode_cbs_map[mode], 0,
+		       sizeof(xfrm_mode_cbs_map[mode]));
 }
 
 const struct xfrm_mode_cbs *xfrm_get_mode_cbs(u8 mode, bool try_load)
@@ -557,7 +557,7 @@ EXPORT_SYMBOL(xfrm_state_free);
 
 static void ___xfrm_state_destroy(struct xfrm_state *x)
 {
-	if (x->mode_cbs && x->mode_cbs->delete_state) {
+	if (x->mode_cbs && x->mode_cbs->delete_state)
 		x->mode_cbs->delete_state(x);
 	hrtimer_cancel(&x->mtimer);
 	del_timer_sync(&x->rtimer);
@@ -2824,7 +2824,6 @@ int __xfrm_init_state(struct xfrm_state *x, bool init_replay, bool offload,
 {
 	const struct xfrm_mode *inner_mode;
 	const struct xfrm_mode *outer_mode;
-	const struct xfrm_mode_cbs *mode_cbs;
 	int family = x->props.family;
 	int err;
 
@@ -2896,7 +2895,7 @@ int __xfrm_init_state(struct xfrm_state *x, bool init_replay, bool offload,
 			goto error;
 	}
 
-	x->mode_cbs = xfrm_get_mode_cbs(x->props.mode);
+	x->mode_cbs = xfrm_get_mode_cbs(x->props.mode, false);
 	if (x->mode_cbs && x->mode_cbs->create_state) {
 		err = x->mode_cbs->create_state(x);
 		if (err)

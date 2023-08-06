@@ -452,14 +452,14 @@ struct xfrm_mode_cbs {
 	int		(*user_init)(struct net *net, struct xfrm_state *x,
 				     struct nlattr **attrs);
 	int		(*copy_to_user)(struct xfrm_state *x, struct sk_buff *skb);
-	void		(*input)(struct xfrm_state *x, struct sk_buff *skb);
+	int (*input)(struct xfrm_state *x, struct sk_buff *skb);
 
 	void		(*xmit_prep)(struct xfrm_state *x, struct sk_buff *skb);
 	int		(*output)(struct net *net, struct sock *sk, struct sk_buff *skb);
 };
 
-int xfrm_register_mode_cbs(const struct xfrm_mode_cbs *mode_cbs);
-void xfrm_unregister_mode_cbs(const struct xfrm_mode_cbs *mode_cbs);
+int xfrm_register_mode_cbs(u8, const struct xfrm_mode_cbs *mode_cbs);
+void xfrm_unregister_mode_cbs(u8);
 const struct xfrm_mode_cbs *xfrm_get_mode_cbs(u8 mode, bool try_load);
 
 static inline int xfrm_af2proto(unsigned int family)

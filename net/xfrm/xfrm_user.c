@@ -781,8 +781,14 @@ static struct xfrm_state *xfrm_state_construct(struct net *net,
 	}
 
 #if IS_ENABLED(CONFIG_XFRM_IPTFS)
-	if (x->props.mode == XFRM_MODE_IPTFS)
-		err = xfrm_iptfs_user_init(net, x, attrs);
+	if (x->props.mode == XFRM_MODE_IPTFS) {
+		const struct xfrm_mode_cbs *mode_cbs;
+
+		mode_cbs = xfrm_get_mode_cbs(x->props.mode, false);
+		if (mode_cbs && mode_cbs->user_init)
+			err = mode_cbs->user_init(net, x, attrs);
+		// err = xfrm_iptfs_user_init(net, x, attrs);
+	}
 	if (err)
 		goto error;
 #endif
@@ -1200,7 +1206,7 @@ static int copy_to_user_state_extra(struct xfrm_state *x,
 		if (ret)
 			goto out;
 	}
-	mode_cbs = xfrm_get_mode_cbs(x->props.mode);
+	mode_cbs = xfrm_get_mode_cbs(x->props.mode, false);
 	if (mode_cbs && mode_cbs->copy_to_user)
 		ret = mode_cbs->copy_to_user(x, skb);
 	if (ret)
