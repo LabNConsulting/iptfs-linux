@@ -2136,6 +2136,114 @@ static enum hrtimer_restart iptfs_delay_timer(struct hrtimer *me)
 	return HRTIMER_NORESTART;
 }
 
+/**
+ * iptfs_encap_add_4 - add outer encaps
+ *
+ * This was originally taken from xfrm4_tunnel_encap_add. The reason for the
+ * copy is that IP-TFS/AGGFRAG can have different functionality for how to set
+ * the TOS/DSCP bits. Sets the protocol to a different value and doesn't do
+ * anything with inner headers as they aren't pointing into a normal IP
+ * singleton inner packet.
+ */
+static int iptfs_encap_add_4(struct xfrm_state *x, struct sk_buff *skb)
+{
+	struct dst_entry *dst = skb_dst(skb);
+	struct iphdr *top_iph;
+	int flags;
+
+	skb_reset_inner_network_header(skb);
+	skb_reset_inner_transport_header(skb);
+
+	skb_set_network_header(skb, -(x->props.header_len - x->props.enc_hdr_len));
+	skb->mac_header = skb->network_header + offsetof(struct iphdr, protocol);
+	skb->transport_header = skb->network_header + sizeof(*top_iph);
+
+	top_iph = ip_hdr(skb);
+	top_iph->ihl = 5;
+	top_iph->version = 4;
+	top_iph->protocol = IPPROTO_AGGFRAG;
+
+	/* DS disclosing depends on XFRM_SA_XFLAG_DONT_ENCAP_DSCP */
+	if (x->props.extra_flags & XFRM_SA_XFLAG_DONT_ENCAP_DSCP)
+		top_iph->tos = 0;
+	else
+		/* TODO: we need to actually acquire this value we are using */
+		top_iph->tos = XFRM_MODE_SKB_CB(skb)->tos;
+
+	top_iph->tos = INET_ECN_encapsulate(top_iph->tos,
+					    XFRM_MODE_SKB_CB(skb)->tos);
+	flags = x->props.flags;
+	if (flags & XFRM_STATE_NOECN)
+		IP_ECN_clear(top_iph);
+
+	top_iph->frag_off = 0;
+	top_iph->ttl = ip4_dst_hoplimit(xfrm_dst_child(dst));
+	top_iph->saddr = x->props.saddr.a4;
+	top_iph->daddr = x->id.daddr.a4;
+	ip_select_ident(dev_net(dst->dev), skb, NULL);
+
+	return 0;
+}
+
+/**
+ * iptfs_encap_add_6 - add outer encaps
+ *
+ * This was originally taken from xfrm6_tunnel_encap_add. The reason for the
+ * copy is that IP-TFS/AGGFRAG can have different functionality for how to set
+ * the flow label and TOS/DSCP bits. It also sets the protocol to a different
+ * value and doesn't do anything with inner headers as they aren't pointing into
+ * a normal IP singleton inner packet.
+ */
+static int iptfs_encap_add_6(struct xfrm_state *x, struct sk_buff *skb)
+{
+	struct dst_entry *dst = skb_dst(skb);
+	struct ipv6hdr *top_iph;
+	int dsfield;
+
+	skb_reset_inner_network_header(skb);
+	skb_reset_inner_transport_header(skb);
+
+	skb_set_network_header(skb,
+			       -x->props.header_len + x->props.enc_hdr_len);
+	skb->mac_header = skb->network_header +
+			  offsetof(struct ipv6hdr, nexthdr);
+	skb->transport_header = skb->network_header + sizeof(*top_iph);
+
+	top_iph = ipv6_hdr(skb);
+	top_iph->version = 6;
+	memset(top_iph->flow_lbl, 0, sizeof(top_iph->flow_lbl));
+	top_iph->nexthdr = IPPROTO_AGGFRAG;
+	if (x->props.extra_flags & XFRM_SA_XFLAG_DONT_ENCAP_DSCP)
+		dsfield = 0;
+	else
+		dsfield = XFRM_MODE_SKB_CB(skb)->tos;
+	dsfield = INET_ECN_encapsulate(dsfield, XFRM_MODE_SKB_CB(skb)->tos);
+	if (x->props.flags & XFRM_STATE_NOECN)
+		dsfield &= ~INET_ECN_MASK;
+	ipv6_change_dsfield(top_iph, 0, dsfield);
+	top_iph->hop_limit = ip6_dst_hoplimit(xfrm_dst_child(dst));
+	top_iph->saddr = *(struct in6_addr *)&x->props.saddr;
+	top_iph->daddr = *(struct in6_addr *)&x->id.daddr;
+
+	return 0;
+}
+
+static int iptfs_prepare_output(struct xfrm_state *x, struct sk_buff *skb)
+{
+	if (x->outer_mode.family == AF_INET)
+		return iptfs_encap_add_4(x, skb);
+	if (x->outer_mode.family == AF_INET6) {
+#if IS_ENABLED(CONFIG_IPV6)
+		return iptfs_encap_add_6(x, skb);
+#else
+		WARN_ON_ONCE(1);
+		return -EAFNOSUPPORT;
+#endif
+	}
+	WARN_ON_ONCE(1);
+	return -EOPNOTSUPP;
+}
+
 /* ========================== */
 /* State Management Functions */
 /* ========================== */
@@ -2291,6 +2399,7 @@ const static struct xfrm_mode_cbs iptfs_mode_cbs = {
 	.copy_to_user = iptfs_copy_to_user,
 	.input = iptfs_input,
 	.output = iptfs_output_collect,
+	.prepare_output = iptfs_prepare_output,
 };
 
 static int __init xfrm_iptfs_init(void)
