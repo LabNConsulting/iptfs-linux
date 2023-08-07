@@ -448,13 +448,29 @@ void xfrm_unregister_type_offload(const struct xfrm_type_offload *type, unsigned
 
 struct xfrm_mode_cbs {
 	struct module	*owner;
-	int		(*create_state)(struct xfrm_state *x);
-	void		(*delete_state)(struct xfrm_state *x);
-	int		(*user_init)(struct net *net, struct xfrm_state *x,
-				     struct nlattr **attrs);
-	int		(*copy_to_user)(struct xfrm_state *x, struct sk_buff *skb);
-	int		(*input)(struct xfrm_state *x, struct sk_buff *skb);
-	int		(*output)(struct net *net, struct sock *sk, struct sk_buff *skb);
+	/* Add/delete state in the new xfrm_state in `x`. */
+	int	(*create_state)(struct xfrm_state *x);
+	void	(*delete_state)(struct xfrm_state *x);
+
+	/* Called while handling the user netlink options. */
+	int	(*user_init)(struct net *net, struct xfrm_state *x,
+			     struct nlattr **attrs);
+	int	(*copy_to_user)(struct xfrm_state *x, struct sk_buff *skb);
+
+	/* Called to handle received xfrm (egress) packets. */
+	int	(*input)(struct xfrm_state *x, struct sk_buff *skb);
+
+	/* Placed in dst_output of the dst when an xfrm_state is bound. */
+	int	(*output)(struct net *net, struct sock *sk, struct sk_buff *skb);
+
+	/**
+	 * Prepare the skb for output for the given mode. Returns:
+	 *    Error value, if 0 then skb values should be as follows:
+	 *    transport_header should point at ESP header
+	 *    network_header should point at Outer IP header
+	 *    mac_header should point at protocol/nexthdr of the outer IP
+	 */
+	int	(*prepare_output)(struct xfrm_state *x, struct sk_buff *skb);
 };
 
 int xfrm_register_mode_cbs(u8 mode, const struct xfrm_mode_cbs *mode_cbs);

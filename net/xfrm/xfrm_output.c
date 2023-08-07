@@ -423,7 +423,6 @@ static int xfrm4_prepare_output(struct xfrm_state *x, struct sk_buff *skb)
 	switch (x->props.mode) {
 	case XFRM_MODE_BEET:
 		return xfrm4_beet_encap_add(x, skb);
-	case XFRM_MODE_IPTFS:
 	case XFRM_MODE_TUNNEL:
 		return xfrm4_tunnel_encap_add(x, skb);
 	}
@@ -447,7 +446,6 @@ static int xfrm6_prepare_output(struct xfrm_state *x, struct sk_buff *skb)
 	switch (x->props.mode) {
 	case XFRM_MODE_BEET:
 		return xfrm6_beet_encap_add(x, skb);
-	case XFRM_MODE_IPTFS:
 	case XFRM_MODE_TUNNEL:
 		return xfrm6_tunnel_encap_add(x, skb);
 	default:
@@ -463,7 +461,6 @@ static int xfrm_outer_mode_output(struct xfrm_state *x, struct sk_buff *skb)
 {
 	switch (x->props.mode) {
 	case XFRM_MODE_BEET:
-	case XFRM_MODE_IPTFS:
 	case XFRM_MODE_TUNNEL:
 		if (x->props.family == AF_INET)
 			return xfrm4_prepare_output(x, skb);
@@ -482,6 +479,8 @@ static int xfrm_outer_mode_output(struct xfrm_state *x, struct sk_buff *skb)
 		WARN_ON_ONCE(1);
 		break;
 	default:
+		if (x->mode_cbs->prepare_output)
+			return x->mode_cbs->prepare_output(x, skb);
 		WARN_ON_ONCE(1);
 		break;
 	}
