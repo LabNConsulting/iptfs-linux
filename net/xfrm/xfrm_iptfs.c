@@ -540,8 +540,8 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 		/* Corrupt data, we don't have enough to complete the packet */
 		XFRM_INC_SA_STATS(xtfs, IPTFS_INPUT_IPLEN_BAD_BLOCKOFF);
 		pr_err_ratelimited(
-			"bad recv blkoff: blkoff %u < ip remaining %u\n",
-			blkoff, ipremain);
+			"bad recv blkoff: blkoff %u < ip remaining %u seq %llu\n",
+			blkoff, ipremain, seq);
 		goto abandon;
 	}
 
@@ -1921,6 +1921,11 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 		if (payload_mtu && payload_mtu < mtu)
 			mtu = payload_mtu;
 		remaining = mtu;
+
+		/* protocol comes to us cleared sometimes */
+		skb->protocol = x->outer_mode.family == AF_INET ?
+					htons(ETH_P_IP) :
+					htons(ETH_P_IPV6);
 
 		pr_devinf(
 			"1st dequeue skb %p len %u data_len %u proto %u seq %u blkoff %u\n",
