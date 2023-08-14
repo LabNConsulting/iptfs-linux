@@ -707,6 +707,8 @@ static inline int pfkey_mode_from_xfrm(int mode)
 		return IPSEC_MODE_TUNNEL;
 	case XFRM_MODE_BEET:
 		return IPSEC_MODE_BEET;
+	case XFRM_MODE_IPTFS:
+		return IPSEC_MODE_IPTFS;
 	default:
 		return -1;
 	}
