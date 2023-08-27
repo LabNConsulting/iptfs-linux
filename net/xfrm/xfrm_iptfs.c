@@ -227,22 +227,6 @@ static int skb_copy_bits_seq(struct skb_seq_state *st, int offset, void *to, int
 	}
 }
 
-static struct sk_buff *iptfs_alloc_header_skb(void)
-{
-	struct sk_buff *skb;
-	uint resv = XFRM_IPTFS_MIN_HEADROOM;
-
-	pr_devinf("resv %u\n", resv);
-	skb = alloc_skb(resv, GFP_ATOMIC);
-	if (!skb) {
-		XFRM_INC_STATS(dev_net(skb->dev), LINUX_MIB_XFRMINERROR);
-		pr_err_ratelimited("failed to alloc skb\n");
-		return NULL;
-	}
-	skb_reserve(skb, resv);
-	return skb;
-}
-
 static struct sk_buff *iptfs_alloc_skb(struct sk_buff *tpl, uint len)
 {
 	struct sk_buff *skb;
@@ -1752,6 +1736,22 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 /* -------------------------- */
 /* Dequeue and send functions */
 /* -------------------------- */
+
+static struct sk_buff *iptfs_alloc_header_skb(void)
+{
+	struct sk_buff *skb;
+	uint resv = XFRM_IPTFS_MIN_HEADROOM;
+
+	pr_devinf("resv %u\n", resv);
+	skb = alloc_skb(resv, GFP_ATOMIC);
+	if (!skb) {
+		XFRM_INC_STATS(dev_net(skb->dev), LINUX_MIB_XFRMINERROR);
+		pr_err_ratelimited("failed to alloc skb\n");
+		return NULL;
+	}
+	skb_reserve(skb, resv);
+	return skb;
+}
 
 static int iptfs_xfrm_output(struct sk_buff *skb, uint remaining)
 {
