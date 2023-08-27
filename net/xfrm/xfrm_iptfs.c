@@ -1655,7 +1655,7 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 		if (!(ok = iptfs_enqueue(xtfs, skb)))
 			goto nospace;
 
-		trace_iptfs_enqueue(skb, xtfs, was_gso);
+		trace_iptfs_enqueue(skb, xtfs, pmtu, was_gso);
 		qcount++;
 
 	}
@@ -1668,14 +1668,13 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 
 	/* Start a delay timer if we don't have one yet */
 	if (!hrtimer_is_queued(&xtfs->iptfs_timer)) {
-		pr_devinf("starting delay timer for possible aggregation\n");
 		/* softirq blocked lest the timer fire and interrupt us */
 		BUG_ON(!in_interrupt());
 		hrtimer_start(&xtfs->iptfs_timer, xtfs->init_delay_ns,
 			      IPTFS_HRTIMER_MODE);
 
 		xtfs->iptfs_settime = ktime_get_raw_fast_ns();
-		pr_devinf("settime <- %llu\n", xtfs->iptfs_settime);
+		trace_iptfs_timer_start(xtfs, xtfs->init_delay_ns);
 	}
 
 	spin_unlock_bh(&x->lock);
@@ -2200,7 +2199,7 @@ static enum hrtimer_restart iptfs_delay_timer(struct hrtimer *me)
 
 	pr_devinf("got %u packets of %u total len\n", (uint)list.qlen,
 		  (uint)osize);
-	pr_devinf("time delta %llu\n",
+	trace_iptfs_timer_expire(xtfs,
 		  (unsigned long long)(ktime_get_raw_fast_ns() - settime));
 
 	iptfs_output_queued(x, &list);
@@ -2497,6 +2496,7 @@ static void iptfs_delete_state(struct xfrm_state *x)
 	hrtimer_cancel(&xtfs->iptfs_timer);
 	hrtimer_cancel(&xtfs->drop_timer);
 	spin_unlock(&xtfs->drop_lock);
+
 	kfree_sensitive(xtfs->w_saved);
 	kfree_sensitive(xtfs);
 }
