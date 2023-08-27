@@ -1567,6 +1567,57 @@ static bool iptfs_enqueue(struct xfrm_iptfs_data *xtfs, struct sk_buff *skb)
 	return true;
 }
 
+static int iptfs_get_cur_pmtu(struct xfrm_state *x, struct xfrm_iptfs_data *xtfs,
+			     struct sk_buff *skb)
+{
+	struct xfrm_dst *xdst = (struct xfrm_dst *)skb_dst(skb);
+	uint payload_mtu = xtfs->payload_mtu;
+	uint pmtu = __iptfs_get_inner_mtu(x, xdst->child_mtu_cached);
+
+	if (payload_mtu && payload_mtu < pmtu)
+		pmtu = payload_mtu;
+
+	return pmtu;
+}
+
+static int iptfs_is_too_big(struct sock *sk, struct sk_buff *skb, uint pmtu)
+{
+	struct flowi6 fl6;
+
+	if (skb->len <= pmtu)
+		return 0;
+
+	/*
+	 * We only send ICMP too big if the user has configured us as
+	 * dont-fragment. We need to adjust something in the
+	 * stack as we are never getting here (good) even when
+	 * our no DF config is set (bad).
+	 */
+	XFRM_INC_STATS(dev_net(skb->dev), LINUX_MIB_XFRMOUTERROR);
+
+	if (!sk)
+		sk = skb->sk;
+	if (sk) {
+		/* TODO: can these be different? */
+		sk = skb->sk ? skb->sk : sk;
+
+		if (ip_hdr(skb)->version == 4)
+			xfrm_local_error(skb, pmtu);
+		else {
+			WARN_ON_ONCE(ip_hdr(skb)->version != 6);
+
+			memset(&fl6, 0, sizeof(fl6));
+			ipv6_local_error(skb->sk, EMSGSIZE, &fl6, pmtu);
+		}
+	} else if (ip_hdr(skb)->version == 4)
+		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED, htonl(pmtu));
+	else {
+		WARN_ON_ONCE(ip_hdr(skb)->version != 6);
+		icmpv6_send(skb, ICMPV6_PKT_TOOBIG, 0, pmtu);
+	}
+	return 1;
+}
+
 /*
  * IPv4/IPv6 packet ingress to IPTFS tunnel, arrange to send in IPTFS payload
  * (i.e., aggregating or fragmenting as appropriate).
@@ -1580,6 +1631,7 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 	struct xfrm_iptfs_data *xtfs = x->mode_data;
 	struct sk_buff *segs, *nskb;
 	uint count, qcount;
+	uint pmtu = 0;
 	bool ok = true;
 	bool was_gso;
 
@@ -1632,8 +1684,13 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 
 	count = qcount = 0;
 
-	/* We can be running on multiple cores or from user context */
+	/* We can be running on multiple cores and from the network softirq or
+	 * from user context depending on where the packet is coming from.
+	 */
 	spin_lock_bh(&x->lock);
+
+	if (xtfs->cfg.dont_frag)
+		pmtu = iptfs_get_cur_pmtu(x, xtfs, skb);
 
 	skb_list_walk_safe (segs, segs, nskb) {
 		skb = segs;
@@ -1645,12 +1702,23 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 		 */
 		if (!ok) {
 		nospace:
-			trace_iptfs_no_queue_space(skb, xtfs, was_gso);
-			kfree_skb(skb);
+			trace_iptfs_no_queue_space(skb, xtfs, pmtu, was_gso);
+			kfree_skb_reason(skb, SKB_DROP_REASON_FULL_RING);
 			continue;
 		}
 
-		/* TODO: should we do our DF + >MTU checks here? */
+		/* If the user indicated no iptfs fragmenting check before
+		 * enqueuing.
+		 */
+		if (xtfs->cfg.dont_frag && iptfs_is_too_big(sk, skb, pmtu)) {
+			trace_iptfs_too_big(skb, xtfs, pmtu, was_gso);
+			kfree_skb_reason(skb, SKB_DROP_REASON_PKT_TOO_BIG);
+			continue;
+		}
+
+		/*
+		 * Enqueue to send in tunnel
+		 */
 
 		if (!(ok = iptfs_enqueue(xtfs, skb)))
 			goto nospace;
@@ -1962,36 +2030,15 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 			mtu = payload_mtu;
 
 		if (skb->len > mtu && xtfs->cfg.dont_frag) {
-			/*
-			 * We only send ICMP too big if the user has configured us as
-			 * dont-fragment. We need to adjust something in the
-			 * stack as we are never getting here (good) even when
-			 * our no DF config is set (bad).
+			/* We handle this cas before enqueueing so we are only
+			 * here b/c MTU changed after we enqueued before we
+			 * dequeued, just drop these.
 			 */
 			XFRM_INC_STATS(dev_net(skb->dev),
 				       LINUX_MIB_XFRMOUTERROR);
 
 			trace_iptfs_first_toobig(skb, xtfs, mtu, blkoff);
-
-			if (skb->sk) {
-				if (ip_hdr(skb)->version == 4)
-					xfrm_local_error(skb, mtu);
-				else {
-					struct flowi6 fl6;
-
-					WARN_ON_ONCE(ip_hdr(skb)->version != 6);
-
-					memset(&fl6, 0, sizeof(fl6));
-					ipv6_local_error(skb->sk, EMSGSIZE,
-							 &fl6, mtu);
-				}
-			} else if (ip_hdr(skb)->version == 4)
-				icmp_send(skb, ICMP_DEST_UNREACH,
-					  ICMP_FRAG_NEEDED, htonl(mtu));
-			else {
-				WARN_ON_ONCE(ip_hdr(skb)->version != 6);
-				icmpv6_send(skb, ICMPV6_PKT_TOOBIG, 0, mtu);
-			}
+			kfree_skb_reason(skb, SKB_DROP_REASON_PKT_TOO_BIG);
 			continue;
 		}
 
