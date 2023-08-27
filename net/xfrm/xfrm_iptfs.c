@@ -1797,7 +1797,7 @@ static int iptfs_first_skb(struct sk_buff **skbp, struct xfrm_iptfs_data *xtfs,
 			   uint mtu, uint blkoff)
 {
 	struct sk_buff *skb = *skbp;
-	struct sk_buff *nskb;
+	struct sk_buff *nskb, *head_skb;
 	int err;
 
 	/*
@@ -1865,9 +1865,31 @@ static int iptfs_first_skb(struct sk_buff **skbp, struct xfrm_iptfs_data *xtfs,
 		}
 
 		/* loop creating skb clones of the data until we have enough iptfs packets */
+		nskb = NULL;
+		head_skb = NULL;
 		while (skb->len > mtu) {
+			if (nskb) {
+				/* We can push an iptfs header onto the first skb but
+				 * not the remaining ones. Allocate a header skb
+				 * for those remaining skb fragments.
+				 */
+				head_skb = iptfs_alloc_header_skb();
+				if (!head_skb)
+					goto nomem;
+
+				/* copy a couple items from skb into it's new head */
+				head_skb->tstamp = skb->tstamp;
+				head_skb->dev = skb->dev;
+				memcpy(head_skb->cb, skb->cb, sizeof(skb->cb));
+				skb_dst_copy(head_skb, skb);
+				__skb_ext_copy(head_skb, skb);
+				__nf_copy(head_skb, skb, false);
+			}
+
 			nskb = skb_clone(skb, GFP_ATOMIC);
 			if (!nskb) {
+				kfree_skb_reason(head_skb, SKB_DROP_REASON_NOMEM);
+			nomem:
 				XFRM_INC_STATS(dev_net(skb->dev),
 					       LINUX_MIB_XFRMOUTERROR);
 				pr_err_ratelimited("failed to clone skb\n");
@@ -1878,9 +1900,30 @@ static int iptfs_first_skb(struct sk_buff **skbp, struct xfrm_iptfs_data *xtfs,
 			__skb_set_length(skb, mtu);
 			__skb_pull(nskb, mtu);
 
+			if (head_skb) {
+				skb_shinfo(head_skb)->frag_list = skb;
+				head_skb->len += skb->len;
+				head_skb->data_len += skb->len;
+				head_skb->truesize += nskb->truesize;
+				skb = head_skb;
+
+				err = __skb_linearize(skb);
+				if (err) {
+					kfree_skb(nskb);
+					pr_err_ratelimited(
+						"skb_linearize failed (2)\n");
+					return err;
+				}
+			}
+
 			trace_iptfs_first_fragmenting(skb, xtfs, mtu, blkoff);
 
 			/* output the full iptfs packet in skb */
+
+			/* XXX prepare_skb pushes an iptfs header but if we're a
+			 * clone this is writing into the data! Same as with the
+			 * one before the return below
+			 */
 			iptfs_output_prepare_skb(skb, blkoff);
 			iptfs_xfrm_output(skb, 0);
 
@@ -2124,6 +2167,7 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 			BUG_ON(skb_is_nonlinear(skb2));
 
 			/* The opportunity for HW offload has ended */
+			/* XXX we are we doing anything with cksum here? */
 			if (skb2->ip_summed == CHECKSUM_PARTIAL) {
 				if (skb_checksum_help(skb2)) {
 					BUG_ON(skb2 != __skb_dequeue(list));
