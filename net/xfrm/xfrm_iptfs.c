@@ -1641,6 +1641,9 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 	/* This will be set if we do a local ping! */
 	// WARN_ON(sk != NULL);
 
+	if (xtfs->cfg.dont_frag)
+		pmtu = iptfs_get_cur_pmtu(x, xtfs, skb);
+
 	/*
 	 * Break apart GSO skbs. If the queue is nearing full then we want the
 	 * accounting and queuing to be based on the individual packets not on the
@@ -1664,6 +1667,7 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 			return PTR_ERR(segs);
 		}
 		consume_skb(skb);
+		skb = NULL;
 	}
 
 	count = qcount = 0;
@@ -1672,9 +1676,6 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 	 * from user context depending on where the packet is coming from.
 	 */
 	spin_lock_bh(&x->lock);
-
-	if (xtfs->cfg.dont_frag)
-		pmtu = iptfs_get_cur_pmtu(x, xtfs, skb);
 
 	skb_list_walk_safe (segs, segs, nskb) {
 		skb = segs;
