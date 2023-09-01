@@ -1656,7 +1656,9 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 	} else {
 		netdev_features_t features = netif_skb_features(skb);
 
-		pr_info_once("received GSO skb (only printing once)\n");
+		/* This will be e.g., TCP we are re-segmenting */
+		pr_info_ratelimited("received GSO: skb->len=%u gso_size=%u\n",
+				    skb->len, skb_shinfo(skb)->gso_size);
 		pr_devinf("splitting up GSO skb %p", skb);
 
 		segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
