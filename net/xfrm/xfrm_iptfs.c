@@ -22,7 +22,7 @@
 #include "trace_iptfs.h"
 
 #define XFRM_IPTFS_MIN_HEADROOM 128
-
+#define IPTFS_FRAG_COPY_MAX 256
 #define NSECS_IN_USEC 1000
 
 #define IPTFS_TYPE_NOCC 0
@@ -1532,6 +1532,41 @@ done:
 /* Enqueue to send functions */
 /* ------------------------- */
 
+static void iptfs_skb_debug(struct sk_buff *skb, const char *tag)
+{
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+
+	pr_devinf(
+		"%s skb->len=%u skb->data_len=%u skb->head=%px shinfo=%px nr_frags=%u dataref=%u gso_size=%u gso_segs=%u frag_list=%p\n",
+		tag, skb->len, skb->data_len, skb->head, shinfo,
+		shinfo->nr_frags, atomic_read(&shinfo->dataref),
+		shinfo->gso_size, shinfo->gso_segs, shinfo->frag_list);
+
+	for (uint i = 0; i < shinfo->nr_frags; i++) {
+		skb_frag_t *frag = &shinfo->frags[i];
+		void *frag_data;
+		u8 *data;
+
+		pr_devinf(
+			"\tfrag=%u page=%px refcnt=0x%x va=%px len=%u/%x offset=%u/%x\n",
+			i, frag->bv_page, page_ref_count(frag->bv_page),
+			(void *)page_address(frag->bv_page),
+			(uint)skb_frag_size(frag), (uint)skb_frag_size(frag),
+			(uint)skb_frag_off(frag), (uint)skb_frag_off(frag));
+
+		frag_data = kmap_atomic(skb_frag_page(frag) /* + pg_idx */);
+
+		data = (u8 *)frag_data + (uint)skb_frag_off(frag) /* +
+								     (abs_offset - st->stepped_offset) */
+			;
+
+		pr_devinf("\tfrag=%u frag_data=%px data=%px\n", i,
+			  (void *)frag_data, (void *)data);
+
+		kunmap_atomic(frag_data);
+	}
+}
+
 /*
  * Check to see if it's OK to queue a packet for sending on tunnel.
  */
@@ -1613,7 +1648,7 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 	struct dst_entry *dst = skb_dst(skb);
 	struct xfrm_state *x = dst->xfrm;
 	struct xfrm_iptfs_data *xtfs = x->mode_data;
-	struct sk_buff *segs, *nskb;
+	struct sk_buff *segs, *nskb, *oskb;
 	uint count, qcount;
 	uint pmtu = 0;
 	bool ok = true;
@@ -1657,7 +1692,8 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 		netdev_features_t features = netif_skb_features(skb);
 
 		pr_info_once("received GSO skb (only printing once)\n");
-		pr_devinf("splitting up GSO skb %p", skb);
+		pr_devinf("splitting up GSO skb %p len %u\n", skb, skb->len);
+		iptfs_skb_debug(skb, "PREGSO");
 
 		segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
 		if (IS_ERR_OR_NULL(segs)) {
@@ -1666,7 +1702,13 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 			kfree_skb(skb);
 			return PTR_ERR(segs);
 		}
+		skb_list_walk_safe (segs, oskb, nskb) {
+			iptfs_skb_debug(oskb, "SPLITSEG");
+		}
 		consume_skb(skb);
+		skb_list_walk_safe (segs, oskb, nskb) {
+			iptfs_skb_debug(oskb, "POSTFREESPLIT");
+		}
 		skb = NULL;
 	}
 
@@ -1693,7 +1735,7 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 		}
 
 		/* If the user indicated no iptfs fragmenting check before
-		 * enqueuing.
+		 * enqueue.
 		 */
 		if (xtfs->cfg.dont_frag && iptfs_is_too_big(sk, skb, pmtu)) {
 			trace_iptfs_too_big(skb, xtfs, pmtu, was_gso);
@@ -1738,6 +1780,7 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 /* Dequeue and send functions */
 /* -------------------------- */
 
+#if 0
 static struct sk_buff *iptfs_alloc_header_skb(void)
 {
 	struct sk_buff *skb;
@@ -1753,6 +1796,7 @@ static struct sk_buff *iptfs_alloc_header_skb(void)
 	skb_reserve(skb, resv);
 	return skb;
 }
+#endif
 
 static int iptfs_xfrm_output(struct sk_buff *skb, uint remaining)
 {
@@ -1794,12 +1838,137 @@ static void iptfs_output_prepare_skb(struct sk_buff *skb, uint blkoff)
 	 */
 }
 
+// struct skb_seq_state skbseq;
+// skb_prepare_seq_read(skb, 0, skb->len, &skbseq);
+// struct skb_seq_state *st;
+static struct sk_buff *iptfs_copy_some_skb(struct skb_seq_state *st,
+					   uint offset, uint copy_len)
+{
+	struct sk_buff *src = st->root_skb;
+	struct sk_buff *skb;
+	struct sec_path *sp;
+	uint resv = XFRM_IPTFS_MIN_HEADROOM;
+	uint i;
+
+	skb = alloc_skb(copy_len + resv, GFP_ATOMIC);
+	if (!skb) {
+		XFRM_INC_STATS(dev_net(src->dev), LINUX_MIB_XFRMINERROR);
+		pr_err_ratelimited("failed to alloc skb resv %u\n",
+				   copy_len + resv);
+		return NULL;
+	}
+
+	pr_devinf("len %u resv %u skb %p\n", copy_len, resv, skb);
+
+	skb_reserve(skb, resv);
+	skb_copy_header(skb, src);
+
+	/* inc refcnt on copied xfrm_state in secpath */
+	sp = skb_sec_path(skb);
+	if (sp)
+		for (i = 0; i < sp->len; i++)
+			xfrm_state_hold(sp->xvec[i]);
+
+	skb->csum = 0;
+	skb->ip_summed = CHECKSUM_NONE;
+
+	/* Now copy `copy_len` data from src */
+	if (skb_copy_bits_seq(st, offset, skb_put(skb, copy_len), copy_len)) {
+		pr_err_ratelimited("bad skb\n");
+		XFRM_INC_STATS(dev_net(src->dev), LINUX_MIB_XFRMINBUFFERERROR);
+		kfree_skb(skb);
+		return NULL;
+	}
+
+	return skb;
+}
+
+static int iptfs_copy_create_frags(struct sk_buff **skbp,
+				   struct xfrm_iptfs_data *xtfs, uint mtu)
+{
+	struct skb_seq_state skbseq;
+	struct list_head sublist;
+	struct sk_buff *skb = *skbp;
+	struct sk_buff *nskb = *skbp;
+	uint copy_len, offset;
+	uint to_copy = skb->len - mtu;
+	uint blkoff = 0;
+	int err = 0;
+
+	INIT_LIST_HEAD(&sublist);
+
+	BUG_ON(skb->len <= mtu);
+	skb_prepare_seq_read(skb, 0, skb->len, &skbseq);
+
+	/* skb (source) will be trimmed and sent first, later */
+
+	offset = mtu;
+	to_copy = skb->len - offset;
+	while (to_copy) {
+		/* We want to leave the last skb frag unsent to allow appending
+		 * aggregation.
+		 */
+		if (nskb) {
+			trace_iptfs_first_fragmenting(nskb, xtfs, mtu, to_copy);
+			list_add_tail(&nskb->list, &sublist);
+		}
+
+		copy_len = to_copy <= mtu ? to_copy : mtu;
+		nskb = iptfs_copy_some_skb(&skbseq, offset, copy_len);
+		if (!nskb) {
+			XFRM_INC_STATS(dev_net(skb->dev),
+				       LINUX_MIB_XFRMOUTERROR);
+			pr_err_ratelimited("skb copy create frags failed\n");
+			skb_abort_seq_read(&skbseq);
+			err = -EINVAL;
+			break;
+		}
+		iptfs_output_prepare_skb(nskb, to_copy);
+		offset += copy_len;
+		to_copy -= copy_len;
+		blkoff = to_copy;
+	}
+	skb_abort_seq_read(&skbseq);
+
+	/* return last fragment that will be unsent (or NULL) */
+	*skbp = nskb;
+	if (nskb)
+		trace_iptfs_first_final_fragment(nskb, xtfs, mtu, blkoff);
+
+	/* trim the original skb to MTU */
+	if (!err)
+		err = pskb_trim(skb, mtu);
+
+	if (err) {
+		/* Free all frags. Don't bother sending a partial packet we will
+		 * never complete.
+		 */
+		kfree_skb(nskb);
+		list_for_each_entry_safe (skb, nskb, &sublist, list) {
+			skb_list_del_init(skb);
+			kfree_skb(skb);
+		}
+		return err;
+	}
+
+	/* prepare the initial fragment with an iptfs header */
+	iptfs_output_prepare_skb(skb, 0);
+
+	/* Send all but last fragment. */
+	list_for_each_entry_safe (skb, nskb, &sublist, list) {
+		skb_list_del_init(skb);
+		/* XXX remaining (0 here) is only used for printk */
+		iptfs_xfrm_output(skb, 0);
+	}
+
+	return 0;
+}
+
 static int iptfs_first_skb(struct sk_buff **skbp, struct xfrm_iptfs_data *xtfs,
 			   uint mtu)
 {
 	struct sk_buff *skb = *skbp;
-	struct sk_buff *nskb, *head_skb;
-	uint blkoff;
+	uint frag_copy_max;
 	int err;
 
 	/*
@@ -1823,121 +1992,144 @@ static int iptfs_first_skb(struct sk_buff **skbp, struct xfrm_iptfs_data *xtfs,
 	/* We've split these up before queuing */
 	BUG_ON(skb_is_gso(skb));
 
-	trace_iptfs_first_dequeue(skb, xtfs, mtu, blkoff);
+	trace_iptfs_first_dequeue(skb, xtfs, mtu, 0);
 
-	/* mtu accounted for all the overhead including the basic header size */
-	if (skb->len > mtu) {
-		BUG_ON(xtfs->cfg.dont_frag);
+	/* Simple case -- it fits. `mtu` accounted for all the overhead
+	 * including the basic IPTFS header.
+	 */
+	if (skb->len <= mtu) {
+		iptfs_output_prepare_skb(skb, 0);
+		return 0;
+	}
 
-		/* A user packet has come in on from an interface with larger
-		 * MTU than the IPTFS tunnel pktsize -- we need to fragment.
-		 *
-		 * orig ====> orig       clone      clone
-		 * skb         skb        1          2
-		 *+--+ head   +--+ head  +--+ head  +--+ head
-		 *|  |	      |  |	 |  |	    |  |
-		 *+--+ data   +--+ data  |  |       |  |        ---
-		 *|x |	      |x |	 |  |       |  |         |
-		 *|x |	      |x |	 |  |       |  |        mtu
-		 *|x |        |x |	 |  |       |  |         |
-		 *|x | ====>  +--+ tail  +--+ data  |  |        ---
-		 *|x |        |  |	 |x |       |  |         |
-		 *|x |	      |  |	 |x |       |  |        mtu
-		 *|x |	      |  |	 |x |       |  |         |
-		 *|x |	      |  |	 +--+ tail  +--+ data   ---
-		 *|x |	      |  |	 |  |	    |x |         | fraglen
-		 *+--+ tail   |  |       |  |	    +--+ tail   ---
-		 *|  |	      |  |	 |  |	    |  |
-		 *+--+ end    +--+ end   +--+ end    +--+ end
-		 *
-		 * We need a linear buffer for the above. Do some performance
-		 * testing, if this is a problem try really complex page sharing
-		 * thing if we have to. This is not a common code path, though.
-		 */
-		if (skb_is_nonlinear(skb)) {
-			pr_info_once("LINEARIZE: skb len %u\n", skb->len);
+	BUG_ON(xtfs->cfg.dont_frag);
+
+	/* If we have less than frag_copy_max for remaining packet we copy
+	 * those tail bytes as it is more efficient.
+	 *
+	 * Also if we have skb fragment lists, as these should be uncommon and
+	 * dealing with lists and page fragments is not worth the complexity
+	 * given that.
+	 */
+
+	frag_copy_max = mtu <= IPTFS_FRAG_COPY_MAX ? mtu : IPTFS_FRAG_COPY_MAX;
+	if (1 || (skb->len - mtu < frag_copy_max) ||
+	    (skb_is_nonlinear(skb) && skb_shinfo(skb)->frag_list)) {
+		/* create frags with copies */
+		return iptfs_copy_create_frags(skbp, xtfs, mtu);
+	}
+#if 0
+
+	/* A user packet has come in on from an interface with larger
+	 * MTU than the IPTFS tunnel pktsize -- we need to fragment.
+	 *
+	 * orig ====> orig       clone      clone
+	 * skb         skb        1          2
+	 *+--+ head   +--+ head  +--+ head  +--+ head
+	 *|  |	      |  |	 |  |	    |  |
+	 *+--+ data   +--+ data  |  |       |  |        ---
+	 *|x |	      |x |	 |  |       |  |         |
+	 *|x |	      |x |	 |  |       |  |        mtu
+	 *|x |        |x |	 |  |       |  |         |
+	 *|x | ====>  +--+ tail  +--+ data  |  |        ---
+	 *|x |        |  |	 |x |       |  |         |
+	 *|x |	      |  |	 |x |       |  |        mtu
+	 *|x |	      |  |	 |x |       |  |         |
+	 *|x |	      |  |	 +--+ tail  +--+ data   ---
+	 *|x |	      |  |	 |  |	    |x |         | fraglen
+	 *+--+ tail   |  |       |  |	    +--+ tail   ---
+	 *|  |	      |  |	 |  |	    |  |
+	 *+--+ end    +--+ end   +--+ end    +--+ end
+	 *
+	 * We need a linear buffer for the above. Do some performance
+	 * testing, if this is a problem try really complex page sharing
+	 * thing if we have to. This is not a common code path, though.
+	 */
+	if (skb_is_nonlinear(skb)) {
+		pr_info_once("LINEARIZE: skb len %u\n", skb->len);
+		err = __skb_linearize(skb);
+		if (err) {
+			XFRM_INC_STATS(dev_net(skb->dev),
+				       LINUX_MIB_XFRMOUTERROR);
+			pr_err_ratelimited("skb_linearize failed\n");
+			return err;
+		}
+	}
+
+	/* loop creating skb clones of the data until we have enough iptfs packets */
+	nskb = NULL;
+	head_skb = NULL;
+	while (skb->len > mtu) {
+		if (nskb) {
+			/* We can push an iptfs header onto the first skb but
+			 * not the remaining ones as they are clones that share
+			 * the same head data. Allocate an skb for the iptfs
+			 * header for each of the remaining skb fragments.
+			 */
+			head_skb = iptfs_alloc_header_skb();
+			if (!head_skb)
+				goto nomem;
+
+			/* copy a couple items from skb into it's new head */
+			head_skb->tstamp = skb->tstamp;
+			head_skb->dev = skb->dev;
+			memcpy(head_skb->cb, skb->cb, sizeof(skb->cb));
+			skb_dst_copy(head_skb, skb);
+			__skb_ext_copy(head_skb, skb);
+			__nf_copy(head_skb, skb, false);
+		}
+
+		nskb = skb_clone(skb, GFP_ATOMIC);
+		if (!nskb) {
+			kfree_skb_reason(head_skb, SKB_DROP_REASON_NOMEM);
+		nomem:
+			XFRM_INC_STATS(dev_net(skb->dev),
+				       LINUX_MIB_XFRMOUTERROR);
+			pr_err_ratelimited("failed to clone skb\n");
+			return -ENOMEM;
+		}
+
+		/* this skb set to mtu len, next pull down mtu len */
+		__skb_set_length(skb, mtu);
+		__skb_pull(nskb, mtu);
+
+		if (head_skb) {
+			skb_shinfo(head_skb)->frag_list = skb;
+			head_skb->len += skb->len;
+			head_skb->data_len += skb->len;
+			head_skb->truesize += nskb->truesize;
+			skb = head_skb;
+
 			err = __skb_linearize(skb);
 			if (err) {
-				XFRM_INC_STATS(dev_net(skb->dev),
-					       LINUX_MIB_XFRMOUTERROR);
-				pr_err_ratelimited("skb_linearize failed\n");
+				kfree_skb(nskb);
+				pr_err_ratelimited(
+					"skb_linearize failed (2)\n");
 				return err;
 			}
 		}
 
-		/* loop creating skb clones of the data until we have enough iptfs packets */
-		nskb = NULL;
-		head_skb = NULL;
-		while (skb->len > mtu) {
-			if (nskb) {
-				/* We can push an iptfs header onto the first skb but
-				 * not the remaining ones. Allocate a header skb
-				 * for those remaining skb fragments.
-				 */
-				head_skb = iptfs_alloc_header_skb();
-				if (!head_skb)
-					goto nomem;
+		trace_iptfs_first_fragmenting(skb, xtfs, mtu, blkoff);
 
-				/* copy a couple items from skb into it's new head */
-				head_skb->tstamp = skb->tstamp;
-				head_skb->dev = skb->dev;
-				memcpy(head_skb->cb, skb->cb, sizeof(skb->cb));
-				skb_dst_copy(head_skb, skb);
-				__skb_ext_copy(head_skb, skb);
-				__nf_copy(head_skb, skb, false);
-			}
+		/* output the full iptfs packet in skb */
 
-			nskb = skb_clone(skb, GFP_ATOMIC);
-			if (!nskb) {
-				kfree_skb_reason(head_skb, SKB_DROP_REASON_NOMEM);
-			nomem:
-				XFRM_INC_STATS(dev_net(skb->dev),
-					       LINUX_MIB_XFRMOUTERROR);
-				pr_err_ratelimited("failed to clone skb\n");
-				return -ENOMEM;
-			}
+		/* XXX prepare_skb pushes an iptfs header but if we're a
+		 * clone this is writing into the data! Same as with the
+		 * one before the return below
+		 */
+		iptfs_output_prepare_skb(skb, blkoff);
+		iptfs_xfrm_output(skb, 0);
 
-			/* this skb set to mtu len, next pull down mtu len */
-			__skb_set_length(skb, mtu);
-			__skb_pull(nskb, mtu);
+		/* nskb->len is the remaining amount until next packet */
+		blkoff = nskb->len;
 
-			if (head_skb) {
-				skb_shinfo(head_skb)->frag_list = skb;
-				head_skb->len += skb->len;
-				head_skb->data_len += skb->len;
-				head_skb->truesize += nskb->truesize;
-				skb = head_skb;
-
-				err = __skb_linearize(skb);
-				if (err) {
-					kfree_skb(nskb);
-					pr_err_ratelimited(
-						"skb_linearize failed (2)\n");
-					return err;
-				}
-			}
-
-			trace_iptfs_first_fragmenting(skb, xtfs, mtu, blkoff);
-
-			/* output the full iptfs packet in skb */
-
-			/* XXX prepare_skb pushes an iptfs header but if we're a
-			 * clone this is writing into the data! Same as with the
-			 * one before the return below
-			 */
-			iptfs_output_prepare_skb(skb, blkoff);
-			iptfs_xfrm_output(skb, 0);
-
-			/* nskb->len is the remaining amount until next packet */
-			blkoff = nskb->len;
-
-			*skbp = skb = nskb;
-		}
-
-		trace_iptfs_first_final_fragment(skb, xtfs, mtu, blkoff);
+		*skbp = skb = nskb;
 	}
 
+	trace_iptfs_first_final_fragment(skb, xtfs, mtu, blkoff);
+
 	iptfs_output_prepare_skb(skb, blkoff);
+#endif
 
 	return 0;
 }
@@ -2047,7 +2239,7 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 			mtu = payload_mtu;
 
 		if (skb->len > mtu && xtfs->cfg.dont_frag) {
-			/* We handle this cas before enqueueing so we are only
+			/* We handle this case before enqueueing so we are only
 			 * here b/c MTU changed after we enqueued before we
 			 * dequeued, just drop these.
 			 */
@@ -2059,22 +2251,22 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 			continue;
 		}
 
-		remaining = mtu;
-
-		if (iptfs_first_skb(&skb, xtfs, mtu)) {
-			kfree_skb(skb);
+		/* iptfs_first_skb will free skb on error as well */
+		if (iptfs_first_skb(&skb, xtfs, mtu))
 			continue;
-		}
 
-		/*
-		 * The MTU has the basic IPTFS header len inc, and we added that
-		 * header to the first skb, so subtract from the skb length
+		/* The returned skb is the last IPTFS fragment, it has it's
+		 * IPTFS header included and it's blkoff set just past the end
+		 * fragment data if needed. The space remaining to send more
+		 * inner packet data is `mtu` - (skb->len - sizeof iptfs
+		 * header). This is b/c the `mtu` value has the basic IPTFS
+		 * header len accounted for, and we added that header to the skb
+		 * so it is a part of skb->len, thus we subtract it from the skb
+		 * length.
 		 */
-		remaining -= (skb->len - sizeof(struct ip_iptfs_hdr));
+		remaining = mtu - (skb->len - sizeof(struct ip_iptfs_hdr));
 
-		/* Rehome fragment lists so we don't have fragments lists of
-		 * fragment lists.
-		 */
+		/* Re-home nested fragment lists fragment lists. */
 		nextp = &skb_shinfo(skb)->frag_list;
 		while (*nextp) {
 			if (skb_has_frag_list(*nextp))
