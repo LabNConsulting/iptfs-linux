@@ -1798,6 +1798,85 @@ static struct sk_buff *iptfs_alloc_header_skb(void)
 }
 #endif
 
+#if 1
+/**
+ * Allocate an skb to hold the headers for a cloned data skb
+ */
+static struct sk_buff *iptfs_alloc_header_for_data(const struct sk_buff *tpl,
+						   uint data_len)
+{
+	struct sk_buff *skb;
+	struct sec_path *sp;
+	uint i, resv = XFRM_IPTFS_MIN_HEADROOM;
+
+	skb = alloc_skb(resv + data_len, GFP_ATOMIC);
+	if (!skb) {
+		XFRM_INC_STATS(dev_net(skb->dev), LINUX_MIB_XFRMINERROR);
+		pr_err_ratelimited("failed to alloc skb resv %u\n",
+				   data_len + resv);
+		return NULL;
+	}
+
+	pr_devinf("resv=%u data_len=%u skb=%p\n", resv, data_len, skb);
+
+	skb_reserve(skb, resv);
+
+	/* from __copy_skb_header */
+	skb->tstamp = tpl->tstamp;
+	skb->dev = tpl->dev;
+	memcpy(skb->cb, tpl->cb, sizeof(skb->cb));
+	skb_dst_copy(skb, tpl);
+	__skb_ext_copy(skb, tpl);
+	__nf_copy(skb, tpl, false);
+	skb->queue_mapping = tpl->queue_mapping;
+
+#define COPY_SKB_FIELD(field)                                                  \
+	do {                                                                   \
+		skb->field = tpl->field;                                       \
+	} while (0)
+
+	// COPY_SKB_FIELD(protocol);
+	// COPY_SKB_FIELD(csum);
+	// COPY_SKB_FIELD(hash);
+	// COPY_SKB_FIELD(priority);
+	// COPY_SKB_FIELD(skb_iif);
+	// COPY_SKB_FIELD(vlan_proto);
+	// COPY_SKB_FIELD(vlan_tci);
+	// COPY_SKB_FIELD(transport_header);
+	// COPY_SKB_FIELD(network_header);
+	// COPY_SKB_FIELD(mac_header);
+	// COPY_SKB_FIELD(inner_protocol);
+	// COPY_SKB_FIELD(inner_transport_header);
+	// COPY_SKB_FIELD(inner_network_header);
+	// COPY_SKB_FIELD(inner_mac_header);
+	// COPY_SKB_FIELD(mark);
+
+#ifdef CONFIG_NETWORK_SECMARK
+	// COPY_SKB_FIELD(secmark);
+#endif
+#ifdef CONFIG_NET_RX_BUSY_POLL
+	// COPY_SKB_FIELD(napi_id);
+#endif
+
+	// COPY_SKB_FIELD(alloc_cpu);
+
+#ifdef CONFIG_XPS
+	// COPY_SKB_FIELD(sender_cpu);
+#endif
+#ifdef CONFIG_NET_SCHED
+	// COPY_SKB_FIELD(tc_index);
+#endif
+
+	/* inc refcnt on copied xfrm_state in secpath */
+	sp = skb_sec_path(skb);
+	if (sp)
+		for (i = 0; i < sp->len; i++)
+			xfrm_state_hold(sp->xvec[i]);
+
+	return skb;
+}
+#endif
+
 static int iptfs_xfrm_output(struct sk_buff *skb, uint remaining)
 {
 	int err;
@@ -1846,6 +1925,12 @@ static struct sk_buff *iptfs_copy_some_skb(struct skb_seq_state *st,
 {
 	struct sk_buff *src = st->root_skb;
 	struct sk_buff *skb;
+
+#if 1
+	skb = iptfs_alloc_header_for_data(src, copy_len);
+	if (!skb)
+		return NULL;
+#else
 	struct sec_path *sp;
 	uint resv = XFRM_IPTFS_MIN_HEADROOM;
 	uint i;
@@ -1858,9 +1943,10 @@ static struct sk_buff *iptfs_copy_some_skb(struct skb_seq_state *st,
 		return NULL;
 	}
 
-	pr_devinf("len %u resv %u skb %p\n", copy_len, resv, skb);
+	pr_devinf("resv=%u copy_len=%u skb=%p\n", resv, copy_len, skb);
 
 	skb_reserve(skb, resv);
+
 	skb_copy_header(skb, src);
 
 	/* inc refcnt on copied xfrm_state in secpath */
@@ -1871,7 +1957,7 @@ static struct sk_buff *iptfs_copy_some_skb(struct skb_seq_state *st,
 
 	skb->csum = 0;
 	skb->ip_summed = CHECKSUM_NONE;
-
+#endif
 	/* Now copy `copy_len` data from src */
 	if (skb_copy_bits_seq(st, offset, skb_put(skb, copy_len), copy_len)) {
 		pr_err_ratelimited("bad skb\n");
@@ -1964,11 +2050,39 @@ static int iptfs_copy_create_frags(struct sk_buff **skbp,
 	return 0;
 }
 
+static bool iptfs_first_should_copy(struct sk_buff *first_skb, uint mtu)
+{
+	uint frag_copy_max;
+
+	/* If we have less than frag_copy_max for remaining packet we copy
+	 * those tail bytes as it is more efficient.
+	 */
+	frag_copy_max = mtu <= IPTFS_FRAG_COPY_MAX ? mtu : IPTFS_FRAG_COPY_MAX;
+	if (first_skb->len - mtu < frag_copy_max)
+		return true;
+
+	/* We actually want to use our nice clone algorithm here */
+	if (!skb_is_nonlinear(first_skb))
+		/* return false; */
+		return true;
+
+	/* If we have skb fragment lists, as these should be uncommon and
+	 * dealing with lists and page fragments is not worth the complexity
+	 * given that.
+	 */
+	if (skb_shinfo(first_skb)->frag_list)
+		return true;
+
+	/* Here we have nr_frags which we can share with split and share */
+
+	/* For now we also copy under all other conditions */
+	return true;
+}
+
 static int iptfs_first_skb(struct sk_buff **skbp, struct xfrm_iptfs_data *xtfs,
 			   uint mtu)
 {
 	struct sk_buff *skb = *skbp;
-	uint frag_copy_max;
 	int err;
 
 	/*
@@ -2004,20 +2118,9 @@ static int iptfs_first_skb(struct sk_buff **skbp, struct xfrm_iptfs_data *xtfs,
 
 	BUG_ON(xtfs->cfg.dont_frag);
 
-	/* If we have less than frag_copy_max for remaining packet we copy
-	 * those tail bytes as it is more efficient.
-	 *
-	 * Also if we have skb fragment lists, as these should be uncommon and
-	 * dealing with lists and page fragments is not worth the complexity
-	 * given that.
-	 */
-
-	frag_copy_max = mtu <= IPTFS_FRAG_COPY_MAX ? mtu : IPTFS_FRAG_COPY_MAX;
-	if (1 || (skb->len - mtu < frag_copy_max) ||
-	    (skb_is_nonlinear(skb) && skb_shinfo(skb)->frag_list)) {
-		/* create frags with copies */
+	if (iptfs_first_should_copy(skb, mtu))
 		return iptfs_copy_create_frags(skbp, xtfs, mtu);
-	}
+
 #if 0
 
 	/* A user packet has come in on from an interface with larger
@@ -2045,6 +2148,7 @@ static int iptfs_first_skb(struct sk_buff **skbp, struct xfrm_iptfs_data *xtfs,
 	 * testing, if this is a problem try really complex page sharing
 	 * thing if we have to. This is not a common code path, though.
 	 */
+	/* XXX we don't want to be here with non-linear for clones below */
 	if (skb_is_nonlinear(skb)) {
 		pr_info_once("LINEARIZE: skb len %u\n", skb->len);
 		err = __skb_linearize(skb);
@@ -2075,6 +2179,7 @@ static int iptfs_first_skb(struct sk_buff **skbp, struct xfrm_iptfs_data *xtfs,
 			head_skb->dev = skb->dev;
 			memcpy(head_skb->cb, skb->cb, sizeof(skb->cb));
 			skb_dst_copy(head_skb, skb);
+			/* XXX need to inc secpath refcnt */
 			__skb_ext_copy(head_skb, skb);
 			__nf_copy(head_skb, skb, false);
 		}
