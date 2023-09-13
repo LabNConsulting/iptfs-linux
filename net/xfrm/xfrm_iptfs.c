@@ -32,15 +32,16 @@
 /* #define GE_PPS(ge, iptfs_ip_mtu) ((1e8 * 10 ^ (ge - 1) / 8) / (iptfs_ip_mtu)) */
 
 #undef PR_DEBUG_INFO
-#define PR_DEBUG_STATE
-#define PR_DEBUG_INGRESS
-#define PR_DEBUG_EGRESS
+#undef PR_DEBUG_STATE
+#undef PR_DEBUG_INGRESS
+#undef PR_DEBUG_EGRESS
 
 #ifdef PR_DEBUG_INFO
-#define _pr_devinf(...) pr_info(__VA_ARGS__)
-#else
 #define _pr_tracek(fmt, ...) trace_printk(fmt, ##__VA_ARGS__)
 #define _pr_devinf(fmt, ...) _pr_tracek(pr_fmt(fmt), ##__VA_ARGS__)
+#else
+#define _pr_tracek(fmt, ...)
+#define _pr_devinf(fmt, ...)
 #endif
 
 #define XFRM_INC_SA_STATS(xtfs, stat)
@@ -1532,6 +1533,7 @@ done:
 /* Enqueue to send functions */
 /* ------------------------- */
 
+#ifdef PR_DEBUG_INGRESS
 static void iptfs_skb_debug(struct sk_buff *skb, const char *tag)
 {
 	struct skb_shared_info *shinfo = skb_shinfo(skb);
@@ -1566,6 +1568,7 @@ static void iptfs_skb_debug(struct sk_buff *skb, const char *tag)
 		kunmap_atomic(frag_data);
 	}
 }
+#endif
 
 /*
  * Check to see if it's OK to queue a packet for sending on tunnel.
@@ -1648,7 +1651,7 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 	struct dst_entry *dst = skb_dst(skb);
 	struct xfrm_state *x = dst->xfrm;
 	struct xfrm_iptfs_data *xtfs = x->mode_data;
-	struct sk_buff *segs, *nskb, *oskb;
+	struct sk_buff *segs, *nskb;
 	uint count, qcount;
 	uint pmtu = 0;
 	bool ok = true;
@@ -1691,9 +1694,12 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 	} else {
 		netdev_features_t features = netif_skb_features(skb);
 
+#ifdef PR_DEBUG_INGRESS
+		struct sk_buff *oskb;
 		pr_info_once("received GSO skb (only printing once)\n");
 		pr_devinf("splitting up GSO skb %p len %u\n", skb, skb->len);
 		iptfs_skb_debug(skb, "PREGSO");
+#endif
 
 		segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
 		if (IS_ERR_OR_NULL(segs)) {
@@ -1702,13 +1708,17 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 			kfree_skb(skb);
 			return PTR_ERR(segs);
 		}
+#ifdef PR_DEBUG_INGRESS
 		skb_list_walk_safe (segs, oskb, nskb) {
 			iptfs_skb_debug(oskb, "SPLITSEG");
 		}
+#endif
 		consume_skb(skb);
+#if 0
 		skb_list_walk_safe (segs, oskb, nskb) {
 			iptfs_skb_debug(oskb, "POSTFREESPLIT");
 		}
+#endif
 		skb = NULL;
 	}
 
@@ -2207,6 +2217,7 @@ static int iptfs_first_skb(struct sk_buff **skbp, struct xfrm_iptfs_data *xtfs,
 
 			err = __skb_linearize(skb);
 			if (err) {
+				/* XXX free skb? */
 				kfree_skb(nskb);
 				pr_err_ratelimited(
 					"skb_linearize failed (2)\n");
@@ -2273,6 +2284,7 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 	struct xfrm_iptfs_data *xtfs = x->mode_data;
 	uint payload_mtu = xtfs->payload_mtu;
 	struct sk_buff *skb, *skb2, **nextp;
+	int err;
 
 	/* For now we are just outputting packets as fast as we can, so if we
 	 * are fragmenting we will do so until the last inner packet has been
@@ -2422,6 +2434,17 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 			remaining -= skb2->len;
 		}
 
+		/* Linearize the buffer now while things might be in cache; xfrm
+		 * crypto is going to do this later. Should check for xfrm
+		 * crypto HW offload before doing this, though.
+		 */
+		if (skb_is_nonlinear(skb)) {
+			err = __skb_linearize(skb);
+			if (err)
+				pr_info_ratelimited(
+					"skb_linearize failed (recoverable): %d\n",
+					err);
+		}
 		/*
 		 * Consider fragmenting this skb2 that didn't fit. For demand
 		 * driven variable sized IPTFS pkts, though this isn't buying
