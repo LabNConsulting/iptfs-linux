@@ -3864,15 +3864,19 @@ static void xfrm_init_pmtu(struct xfrm_dst **bundle, int nr)
 		u32 pmtu, route_mtu_cached;
 		struct dst_entry *dst;
 
+		/* Get the xfrm's dst MTU (i.e., interface/route). */
 		dst = &xdst->u.dst;
 		pmtu = dst_mtu(xfrm_dst_child(dst));
 		xdst->child_mtu_cached = pmtu;
 
+		/* Adjust this MTU down according to the xfrm mode. */
 		pmtu = xfrm_state_mtu(dst->xfrm, pmtu);
 
+		/* Get the inner traffic's route's MTU */
 		route_mtu_cached = dst_mtu(xdst->route);
 		xdst->route_mtu_cached = route_mtu_cached;
 
+		/* Adjust MTU to no larger than inner traffic route MTU. */
 		if (pmtu > route_mtu_cached)
 			pmtu = route_mtu_cached;
 
