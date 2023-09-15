@@ -82,9 +82,6 @@ static u32 __iptfs_get_inner_mtu(struct xfrm_state *x, int outer_mtu);
 static enum hrtimer_restart iptfs_delay_timer(struct hrtimer *me);
 static enum hrtimer_restart iptfs_drop_timer(struct hrtimer *me);
 
-/* For leaking */
-static struct kmem_cache *iptfs_leak_cache __ro_after_init;
-
 /* ================= */
 /* Utility Functions */
 /* ================= */
@@ -125,8 +122,7 @@ static inline uint iptfs_payload_proto_seq(struct sk_buff *skb)
 static inline u64 __esp_seq(struct sk_buff *skb)
 {
 	u64 seq = ntohl(XFRM_SKB_CB(skb)->seq.input.low);
-	return seq;
-	// return seq | (u64)ntohl(XFRM_SKB_CB(skb)->seq.input.hi) << 32;
+	return seq | (u64)ntohl(XFRM_SKB_CB(skb)->seq.input.hi) << 32;
 }
 
 /* ================================== */
@@ -158,10 +154,6 @@ static int skb_copy_bits_seq(struct skb_seq_state *st, int offset, void *to, int
 	uint sqlen;
 
 	for (;;) {
-		/*
-		 * what happens if we advance but then are called again with
-		 * original offset? This does NOT work.
-		 */
 		sqlen = skb_seq_read(offset, &data, st);
 		if (sqlen == 0)
 			return -ENOMEM;
@@ -197,12 +189,6 @@ static struct sk_buff *iptfs_alloc_skb(struct sk_buff *tpl, uint len)
 	/* Let's not copy the checksum */
 	skb->csum = 0;
 	skb->ip_summed = CHECKSUM_NONE;
-
-	// the skb_copy_header does the following so figure out wth it is :)
-	// skb_shinfo(new)->gso_size = skb_shinfo(old)->gso_size;
-	// skb_shinfo(new)->gso_segs = skb_shinfo(old)->gso_segs;
-	// skb_shinfo(new)->gso_type = skb_shinfo(old)->gso_type;
-	BUG_ON(!skb_sec_path(skb));
 
 	return skb;
 }
@@ -289,6 +275,8 @@ static void iptfs_complete_inner_skb(struct xfrm_state *x, struct sk_buff *skb)
 	 * set this.
 	 */
 	skb_reset_transport_header(skb);
+
+	/* TODO: mark csum as being OK */
 
 	/*
 	 * Our skb will contain the header data copied when this outer packet
@@ -486,8 +474,6 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 		goto abandon;
 	}
 
-	/* TODO: update or clear cksum for the reconstructed packet in skb? */
-
 	if (copylen < ipremain)
 		xtfs->ra_wantseq++;
 	else {
@@ -509,7 +495,6 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
  */
 static int iptfs_input_ordered(struct xfrm_state *x, struct sk_buff *skb)
 {
-	// void *leak;
 	u8 hbytes[sizeof(struct ipv6hdr)];
 	struct ip_iptfs_cc_hdr iptcch;
 	struct skb_seq_state skbseq;
@@ -534,12 +519,6 @@ static int iptfs_input_ordered(struct xfrm_state *x, struct sk_buff *skb)
 
 	/* large enough to hold both types of header */
 	ipth = (struct ip_iptfs_hdr *)&iptcch;
-
-	/* when we support DSCP copy option ... */
-	// static inline __u8 ipv4_get_dsfield(const struct iphdr *iph)
-	// static inline __u8 ipv6_get_dsfield(const struct ipv6hdr *ipv6h)
-
-	// err = skb_unclone(skb, GFP_ATOMIC);
 
 	/* Save the old mac header if set */
 	old_mac = skb_mac_header_was_set(skb) ? skb_mac_header(skb) : NULL;
@@ -687,8 +666,8 @@ static int iptfs_input_ordered(struct xfrm_state *x, struct sk_buff *skb)
 				 * iptfs header as well as any initial fragment
 				 * for previous inner packet reassembly
 				 *
-				 * TODO: talk about how this is re-using tailroom
-				 * for future fragment copyin
+				 * The remaining tailroom will be used for
+				 * future fragment data.
 				 */
 				tmp = skb->data;
 				pskb_pull(skb, data);
@@ -719,8 +698,6 @@ static int iptfs_input_ordered(struct xfrm_state *x, struct sk_buff *skb)
 				 * but we can copy that into the tail of this
 				 * skb b/c we have tailroom.
 				 */
-				// This is done below for everyone
-				// capturelen = min(iplen, remaining);
 
 				/* all pointers could be changed now reset walk */
 				skb_abort_seq_read(&skbseq);
@@ -1366,6 +1343,7 @@ static bool iptfs_enqueue(struct xfrm_iptfs_data *xtfs, struct sk_buff *skb)
 
 	/* For now we use a predefined constant value, eventually configuration */
 	if (xtfs->queue_size + skb->len > xtfs->cfg.max_queue_size) {
+		/* XXX: add state (replace?) */
 		pr_warn_ratelimited("no space: qsize: %u skb len %u max %u\n",
 				    xtfs->queue_size, (uint)skb->len,
 				    xtfs->cfg.max_queue_size);
@@ -1404,12 +1382,7 @@ static int iptfs_is_too_big(struct sock *sk, struct sk_buff *skb, uint pmtu)
 	 */
 	XFRM_INC_STATS(dev_net(skb->dev), LINUX_MIB_XFRMOUTERROR);
 
-	if (!sk)
-		sk = skb->sk;
 	if (sk) {
-		/* TODO: can these be different? */
-		sk = skb->sk ? skb->sk : sk;
-
 		if (ip_hdr(skb)->version == 4)
 			xfrm_local_error(skb, pmtu);
 		else {
@@ -1479,9 +1452,7 @@ static int iptfs_output_collect(struct net *net, struct sock *sk,
 		segs = skb;
 		BUG_ON(skb->next);
 	} else {
-		netdev_features_t features = netif_skb_features(skb);
-
-		segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
+		segs = skb_gso_segment(skb, 0);
 		if (IS_ERR_OR_NULL(segs)) {
 			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
 			kfree_skb(skb);
@@ -1959,11 +1930,6 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 			}
 
 
-			/* XXX free up XFRM extras? Not sure why this wouldn't
-			 * happen as the list get's walked and freed but maybe
-			 * this is out leak?
-			 */
-			// skb_ext_putskb_shinfo(skb)->frag_list = skb2;
 			*nextp = skb2;
 			nextp = &skb2->next;
 			BUG_ON(*nextp != NULL);
@@ -2024,11 +1990,6 @@ static enum hrtimer_restart iptfs_delay_timer(struct hrtimer *me)
 	 * timer can be set again, from another CPU either in softirq or user
 	 * context (not from this one since we are running at softirq level
 	 * already).
-	 *
-	 * TODO: verify that a timer callback doesn't need to be re-entrant, i.e.,
-	 * that it will never be running concurrently on different CPUs.
-	 * If we have to be re-entrant we probably want a lock to avoid
-	 * spewing packets out of order.
 	 */
 
 	trace_iptfs_timer_expire(xtfs,
@@ -2040,7 +2001,7 @@ static enum hrtimer_restart iptfs_delay_timer(struct hrtimer *me)
 }
 
 /**
- * iptfs_encap_add_4 - add outer encaps
+ * iptfs_encap_add_ipv4 - add outer encaps
  *
  * This was originally taken from xfrm4_tunnel_encap_add. The reason for the
  * copy is that IP-TFS/AGGFRAG can have different functionality for how to set
@@ -2048,7 +2009,7 @@ static enum hrtimer_restart iptfs_delay_timer(struct hrtimer *me)
  * anything with inner headers as they aren't pointing into a normal IP
  * singleton inner packet.
  */
-static int iptfs_encap_add_4(struct xfrm_state *x, struct sk_buff *skb)
+static int iptfs_encap_add_ipv4(struct xfrm_state *x, struct sk_buff *skb)
 {
 	struct dst_entry *dst = skb_dst(skb);
 	struct iphdr *top_iph;
@@ -2066,13 +2027,8 @@ static int iptfs_encap_add_4(struct xfrm_state *x, struct sk_buff *skb)
 	top_iph->version = 4;
 	top_iph->protocol = IPPROTO_AGGFRAG;
 
-	/* DS disclosing depends on XFRM_SA_XFLAG_DONT_ENCAP_DSCP */
-	if (x->props.extra_flags & XFRM_SA_XFLAG_DONT_ENCAP_DSCP)
-		top_iph->tos = 0;
-	else
-		/* TODO: we need to actually acquire this value we are using */
-		top_iph->tos = XFRM_MODE_SKB_CB(skb)->tos;
-
+	/* There's no great value to pick for TOS here so zero. */
+	top_iph->tos = 0;
 	top_iph->tos = INET_ECN_encapsulate(top_iph->tos,
 					    XFRM_MODE_SKB_CB(skb)->tos);
 	flags = x->props.flags;
@@ -2089,7 +2045,7 @@ static int iptfs_encap_add_4(struct xfrm_state *x, struct sk_buff *skb)
 }
 
 /**
- * iptfs_encap_add_6 - add outer encaps
+ * iptfs_encap_add_ipv6 - add outer encaps
  *
  * This was originally taken from xfrm6_tunnel_encap_add. The reason for the
  * copy is that IP-TFS/AGGFRAG can have different functionality for how to set
@@ -2097,7 +2053,7 @@ static int iptfs_encap_add_4(struct xfrm_state *x, struct sk_buff *skb)
  * value and doesn't do anything with inner headers as they aren't pointing into
  * a normal IP singleton inner packet.
  */
-static int iptfs_encap_add_6(struct xfrm_state *x, struct sk_buff *skb)
+static int iptfs_encap_add_ipv6(struct xfrm_state *x, struct sk_buff *skb)
 {
 	struct dst_entry *dst = skb_dst(skb);
 	struct ipv6hdr *top_iph;
@@ -2134,10 +2090,10 @@ static int iptfs_encap_add_6(struct xfrm_state *x, struct sk_buff *skb)
 static int iptfs_prepare_output(struct xfrm_state *x, struct sk_buff *skb)
 {
 	if (x->outer_mode.family == AF_INET)
-		return iptfs_encap_add_4(x, skb);
+		return iptfs_encap_add_ipv4(x, skb);
 	if (x->outer_mode.family == AF_INET6) {
 #if IS_ENABLED(CONFIG_IPV6)
-		return iptfs_encap_add_6(x, skb);
+		return iptfs_encap_add_ipv6(x, skb);
 #else
 		WARN_ON_ONCE(1);
 		return -EAFNOSUPPORT;
@@ -2156,15 +2112,13 @@ static int iptfs_prepare_output(struct xfrm_state *x, struct sk_buff *skb)
  */
 static u32 __iptfs_get_inner_mtu(struct xfrm_state *x, int outer_mtu)
 {
-	// struct xfrm_iptfs_data *xtfs = x->mode_data;
 	struct crypto_aead *aead;
 	u32 blksize;
 
 	aead = x->data;
 	blksize = ALIGN(crypto_aead_blocksize(aead), 4);
 	return ((outer_mtu - x->props.header_len - crypto_aead_authsize(aead)) &
-		~(blksize - 1)) -
-	       2;
+		~(blksize - 1)) - 2;
 }
 
 /**
@@ -2192,7 +2146,7 @@ static int iptfs_user_init(struct net *net, struct xfrm_state *x,
 	struct xfrm_iptfs_config *xc;
 
 	if (x->props.mode != XFRM_MODE_IPTFS)
-		return EINVAL;
+		return -EINVAL;
 
 	xc = &xtfs->cfg;
 	xc->reorder_win_size = net->xfrm.sysctl_iptfs_rewin;
@@ -2215,11 +2169,8 @@ static int iptfs_user_init(struct net *net, struct xfrm_state *x,
 			xtfs->payload_mtu = 0;
 		else if (xc->pkt_size > x->props.header_len)
 			xtfs->payload_mtu = xc->pkt_size - x->props.header_len;
-		else {
-			pr_err("requested iptfs pkt-size %u <= packet header len %u\n",
-			       xc->pkt_size, x->props.header_len);
-			return EINVAL;
-		}
+		else
+			return -EINVAL;
 	}
 	if (attrs[XFRMA_IPTFS_MAX_QSIZE])
 		xc->max_queue_size = nla_get_u32(attrs[XFRMA_IPTFS_MAX_QSIZE]);
@@ -2247,11 +2198,14 @@ static int iptfs_copy_to_user(struct xfrm_state *x, struct sk_buff *skb)
 	ret = nla_put_u16(skb, XFRMA_IPTFS_REORD_WIN, xc->reorder_win_size);
 	if (ret)
 		return ret;
-	if ((ret = nla_put_u32(skb, XFRMA_IPTFS_PKT_SIZE, xc->pkt_size)))
+	ret = nla_put_u32(skb, XFRMA_IPTFS_PKT_SIZE, xc->pkt_size);
+	if (ret)
 		return ret;
-	if ((ret = nla_put_u32(skb, XFRMA_IPTFS_MAX_QSIZE, xc->max_queue_size)))
+	ret = nla_put_u32(skb, XFRMA_IPTFS_MAX_QSIZE, xc->max_queue_size);
+	if (ret)
 		return ret;
-	if ((ret = nla_put_u32(skb, XFRMA_IPTFS_DROP_TIME, xc->drop_time_us)))
+	ret = nla_put_u32(skb, XFRMA_IPTFS_DROP_TIME, xc->drop_time_us);
+	if (ret)
 		return ret;
 	ret = nla_put_u32(skb, XFRMA_IPTFS_IN_DELAY, xc->init_delay_us);
 	return ret;
@@ -2261,16 +2215,12 @@ static int iptfs_create_state(struct xfrm_state *x)
 {
 	struct xfrm_iptfs_data *xtfs;
 
-	xtfs = kzalloc_node(sizeof(*xtfs), GFP_KERNEL, NUMA_NO_NODE);
-	x->mode_data = xtfs;
+	xtfs = kzalloc(sizeof(*xtfs), GFP_KERNEL);
 	if (!xtfs)
 		return -ENOMEM;
+	x->mode_data = xtfs;
 
 	xtfs->x = x;
-	xtfs->cfg.reorder_win_size = XFRM_IPTFS_DEFAULT_REORDER_WINDOW;
-	xtfs->cfg.max_queue_size = XFRM_IPTFS_DEFAULT_MAX_QUEUE_SIZE;
-	xtfs->cfg.init_delay_us = XFRM_IPTFS_DEFAULT_INIT_DELAY_USECS;
-	xtfs->cfg.drop_time_us = XFRM_IPTFS_DEFAULT_DROP_TIME_USECS;
 
 	__skb_queue_head_init(&xtfs->queue);
 	xtfs->init_delay_ns = xtfs->cfg.init_delay_us * NSECS_IN_USEC;
@@ -2331,13 +2281,6 @@ static int __init xfrm_iptfs_init(void)
 	err = xfrm_register_mode_cbs(XFRM_MODE_IPTFS, &iptfs_mode_cbs);
 	if (err < 0)
 		pr_info("%s: can't register IP-TFS\n", __func__);
-
-	/*
-	 * Create a cache we will leak out of.
-	 */
-	iptfs_leak_cache =
-		kmem_cache_create("iptfs_leak_cache", 100, 0,
-				  SLAB_HWCACHE_ALIGN | SLAB_PANIC, NULL);
 
 	return err;
 }
