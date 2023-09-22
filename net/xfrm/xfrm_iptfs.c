@@ -85,24 +85,24 @@ static enum hrtimer_restart iptfs_drop_timer(struct hrtimer *me);
 /* Utility Functions */
 /* ================= */
 
-static inline uint iptfs_payload_proto(struct sk_buff *skb)
+static inline uint __trace_ip_proto(struct iphdr *iph)
 {
-	if (((struct iphdr *)skb->data)->version == 4)
-		return ((struct iphdr *)skb->data)->protocol;
-	return ((struct ipv6hdr *)skb->data)->nexthdr;
+	if (iph->version == 4)
+		return iph->protocol;
+	return ((struct ipv6hdr *)iph)->nexthdr;
 }
 
-static inline uint iptfs_payload_proto_seq(struct sk_buff *skb)
+static uint __trace_ip_proto_seq(struct iphdr *iph)
 {
 	void *nexthdr;
 	uint protocol = 0;
 
-	if (ip_hdr(skb)->version == 4) {
-		nexthdr = (void *)(ip_hdr(skb) + 1);
-		protocol = ip_hdr(skb)->protocol;
-	} else if (ip_hdr(skb)->version == 6) {
-		nexthdr = (void *)(ipv6_hdr(skb) + 1);
-		protocol = ipv6_hdr(skb)->nexthdr;
+	if (iph->version == 4) {
+		nexthdr = (void *)(iph + 1);
+		protocol = iph->protocol;
+	} else if (iph->version == 6) {
+		nexthdr = (void *)(((struct ipv6hdr *)(iph)) + 1);
+		protocol = ((struct ipv6hdr *)(iph))->nexthdr;
 	}
 	switch (protocol) {
 	case IPPROTO_ICMP:
@@ -1648,13 +1648,9 @@ static int iptfs_copy_create_frags(struct sk_buff **skbp,
 	offset = mtu;
 	to_copy = skb->len - offset;
 	while (to_copy) {
-		/* We want to leave the last skb frag unsent to allow appending
-		 * aggregation.
-		 */
-		if (nskb) {
-			trace_iptfs_first_fragmenting(nskb, xtfs, mtu, to_copy);
-			list_add_tail(&nskb->list, &sublist);
-		}
+		/* Send all but last fragment to allow agg. append */
+		trace_iptfs_first_fragmenting(nskb, xtfs, mtu, to_copy, NULL);
+		list_add_tail(&nskb->list, &sublist);
 
 		copy_len = to_copy <= mtu ? to_copy : mtu;
 		nskb = iptfs_copy_some_skb(&skbseq, offset, copy_len);
@@ -1675,7 +1671,7 @@ static int iptfs_copy_create_frags(struct sk_buff **skbp,
 	/* return last fragment that will be unsent (or NULL) */
 	*skbp = nskb;
 	if (nskb)
-		trace_iptfs_first_final_fragment(nskb, xtfs, mtu, blkoff);
+		trace_iptfs_first_final_fragment(nskb, xtfs, mtu, blkoff, NULL);
 
 	/* trim the original skb to MTU */
 	if (!err)
@@ -1761,7 +1757,7 @@ static int iptfs_first_skb(struct sk_buff **skbp, struct xfrm_iptfs_data *xtfs,
 	/* We've split these up before queuing */
 	BUG_ON(skb_is_gso(skb));
 
-	trace_iptfs_first_dequeue(skb, xtfs, mtu, 0);
+	trace_iptfs_first_dequeue(skb, xtfs, mtu, 0, ip_hdr(skb));
 
 	/* Simple case -- it fits. `mtu` accounted for all the overhead
 	 * including the basic IPTFS header.
@@ -1816,35 +1812,28 @@ static void iptfs_consume_frags(struct sk_buff *to, struct sk_buff *from)
 	unsigned int new_truesize;
 	unsigned char *addr;
 
-	/* Take the head frag if any data present. */
-	if (skb_headlen(from)) {
+	/* If we have data in a head page, grab it */
+	if (!skb_headlen(from))
+		new_truesize = SKB_TRUESIZE(skb_end_offset(from));
+	else {
 		page = virt_to_head_page(from->data);
 		addr = (unsigned char *)page_address(page);
 		skb_frag_fill_page_desc(frag, page, from->data - addr,
 					skb_headlen(from));
-		/* grab a ref so it doesn't get freed with the skb */
 		skb_frag_ref(to, toi->nr_frags++);
-		frag++;
+		new_truesize = SKB_DATA_ALIGN(sizeof(struct sk_buff));
 	}
 
-	/* Take the regular frags */
+	/* Move any other page fragments rather than copy */
 	memcpy(frag, fromi->frags, sizeof(*frag) * fromi->nr_frags);
 	toi->nr_frags += fromi->nr_frags;
-
-	if (skb_headlen(from)) {
-		/* Apparently, we dont need to clear fromi->nr_frags here */
-		NAPI_GRO_CB(from)->free = NAPI_GRO_FREE_STOLEN_HEAD;
-		new_truesize = SKB_DATA_ALIGN(sizeof(struct sk_buff));
-	} else {
-		NAPI_GRO_CB(from)->free = NAPI_GRO_FREE;
-		fromi->nr_frags = 0;
-		new_truesize = SKB_TRUESIZE(skb_end_offset(from));
-		from->data_len = 0;
-		from->len = 0;
-	}
+	fromi->nr_frags = 0;
+	from->data_len = 0;
+	from->len = 0;
 	to->truesize += from->truesize - new_truesize;
 	from->truesize = new_truesize;
-	NAPI_GRO_CB(from)->same_flow = 1;
+
+	/* We are done with this SKB */
 	consume_skb(from);
 }
 
@@ -1901,7 +1890,7 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 			XFRM_INC_STATS(dev_net(skb->dev),
 				       LINUX_MIB_XFRMOUTERROR);
 
-			trace_iptfs_first_toobig(skb, xtfs, mtu, 0);
+			trace_iptfs_first_toobig(skb, xtfs, mtu, 0, ip_hdr(skb));
 			kfree_skb_reason(skb, SKB_DROP_REASON_PKT_TOO_BIG);
 			continue;
 		}
@@ -1942,7 +1931,7 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 		 * skbs.
 		 */
 
-		if (shi->frag_list || skb_cloned(skb))
+		if (shi->frag_list || skb_cloned(skb) || skb_shared(skb))
 			share_ok = false;
 
 		/* See if we have enough space to simply append.
@@ -1950,6 +1939,9 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 		 * NOTE: Maybe do not append if we will be mis-aligned,
 		 * SW-based endpoints will probably have to copy in this
 		 * case.
+		 */
+		/* Maybe share_ok check here, so only aggregate if we can avoid
+		 * slow path?
 		 */
 		while ((skb2 = skb_peek(list)) && skb2->len <= remaining) {
 			__skb_unlink(skb2, list);
@@ -1968,9 +1960,10 @@ static void iptfs_output_queued(struct xfrm_state *x, struct sk_buff_head *list)
 			shi2 = skb_shinfo(skb2);
 			if (share_ok &&
 			    (shi2->frag_list || !skb2->head_frag ||
-			     skb_headlen(skb2) ||
+			     /* would like to understand why these have to be the same */
 			     (skb->pp_recycle != skb2->pp_recycle) ||
-			     NAPI_GRO_CB(skb)->flush ||
+			     skb_cloned(skb2) || skb_shared(skb2) ||
+			     skb_zcopy(skb2) ||
 			     (shi->nr_frags + shi2->nr_frags + 1 >
 			      MAX_SKB_FRAGS)))
 				share_ok = false;

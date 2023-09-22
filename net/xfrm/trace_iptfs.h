@@ -16,6 +16,7 @@
 #include <linux/kernel.h>
 #include <linux/skbuff.h>
 #include <linux/tracepoint.h>
+#include <net/ip.h>
 
 struct xfrm_iptfs_data;
 
@@ -81,8 +82,8 @@ DECLARE_EVENT_CLASS(iptfs_ingress_preq_event,
 			    __entry->skb_len = skb->len;
 			    __entry->data_len = skb->data_len;
 			    __entry->queue_size = xtfs->cfg.max_queue_size - xtfs->queue_size;
-			    __entry->proto = iptfs_payload_proto(skb);
-			    __entry->proto_seq = iptfs_payload_proto_seq(skb);
+			    __entry->proto = __trace_ip_proto(ip_hdr(skb));
+			    __entry->proto_seq = __trace_ip_proto_seq(ip_hdr(skb));
 			    __entry->pmtu = pmtu;
 			__entry->was_gso = was_gso;
 			    ),
@@ -103,8 +104,8 @@ DEFINE_EVENT(iptfs_ingress_preq_event, iptfs_too_big,
 	     TP_ARGS(skb, xtfs, pmtu, was_gso));
 
 DECLARE_EVENT_CLASS(iptfs_ingress_postq_event,
-		    TP_PROTO(struct sk_buff *skb, struct xfrm_iptfs_data *xtfs, u32 mtu, u16 blkoff),
-		    TP_ARGS(skb, xtfs, mtu, blkoff),
+		    TP_PROTO(struct sk_buff *skb, struct xfrm_iptfs_data *xtfs, u32 mtu, u16 blkoff, struct iphdr *iph),
+		    TP_ARGS(skb, xtfs, mtu, blkoff, iph),
 		    TP_STRUCT__entry(
 			__field(struct sk_buff *, skb)
 			__field(u32, skb_len)
@@ -119,8 +120,8 @@ DECLARE_EVENT_CLASS(iptfs_ingress_postq_event,
 			__entry->data_len = skb->data_len;
 			__entry->mtu = mtu;
 			__entry->blkoff = blkoff;
-			__entry->proto = iptfs_payload_proto(skb);
-			__entry->proto_seq = iptfs_payload_proto_seq(skb);
+			__entry->proto = iph ? __trace_ip_proto(iph) : 0;
+			__entry->proto_seq = iph ? __trace_ip_proto_seq(iph) : 0;
 		    ),
 		    TP_printk("INGRPSTQ: skb=%p len=%u data_len=%u mtu=%u blkoff=%u proto=%u proto_seq=%u",
 		      __entry->skb, __entry->skb_len, __entry->data_len, __entry->mtu, __entry->blkoff,
@@ -128,20 +129,20 @@ DECLARE_EVENT_CLASS(iptfs_ingress_postq_event,
 
 
 DEFINE_EVENT(iptfs_ingress_postq_event, iptfs_first_dequeue,
-	     TP_PROTO(struct sk_buff *skb, struct xfrm_iptfs_data *xtfs, u32 mtu, u16 blkoff),
-	     TP_ARGS(skb, xtfs, mtu, blkoff));
+	     TP_PROTO(struct sk_buff *skb, struct xfrm_iptfs_data *xtfs, u32 mtu, u16 blkoff, struct iphdr *iph),
+	     TP_ARGS(skb, xtfs, mtu, blkoff, iph));
 
 DEFINE_EVENT(iptfs_ingress_postq_event, iptfs_first_fragmenting,
-	     TP_PROTO(struct sk_buff *skb, struct xfrm_iptfs_data *xtfs, u32 mtu, u16 blkoff),
-	     TP_ARGS(skb, xtfs, mtu, blkoff));
+	     TP_PROTO(struct sk_buff *skb, struct xfrm_iptfs_data *xtfs, u32 mtu, u16 blkoff, struct iphdr *iph),
+	     TP_ARGS(skb, xtfs, mtu, blkoff, iph));
 
 DEFINE_EVENT(iptfs_ingress_postq_event, iptfs_first_final_fragment,
-	     TP_PROTO(struct sk_buff *skb, struct xfrm_iptfs_data *xtfs, u32 mtu, u16 blkoff),
-	     TP_ARGS(skb, xtfs, mtu, blkoff));
+	     TP_PROTO(struct sk_buff *skb, struct xfrm_iptfs_data *xtfs, u32 mtu, u16 blkoff, struct iphdr *iph),
+	     TP_ARGS(skb, xtfs, mtu, blkoff, iph));
 
 DEFINE_EVENT(iptfs_ingress_postq_event, iptfs_first_toobig,
-	     TP_PROTO(struct sk_buff *skb, struct xfrm_iptfs_data *xtfs, u32 mtu, u16 blkoff),
-	     TP_ARGS(skb, xtfs, mtu, blkoff));
+	     TP_PROTO(struct sk_buff *skb, struct xfrm_iptfs_data *xtfs, u32 mtu, u16 blkoff, struct iphdr *iph),
+	     TP_ARGS(skb, xtfs, mtu, blkoff, iph));
 
 
 DECLARE_EVENT_CLASS(iptfs_timer_event,
