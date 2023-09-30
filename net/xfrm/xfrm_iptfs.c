@@ -209,25 +209,31 @@ static void skb_head_to_frag(const struct sk_buff *skb, skb_frag_t *frag)
 /**
  * struct skb_frag_walk - use to track a walk through fragments
  * @fragi: current fragment index
- * @offset: current offset into @fragi (not inc. page offset)
  * @past: length of data in fragments before @fragi
  * @total: length of data in all fragments
  * @nr_frags: number of fragments present in array
- * @frags: the page fragments
+ * @initial_offset: the value passed in to skb_prepare_frag_walk()
+ * @pp_recycle: copy of skb->pp_recycle
+ * @frags: the page fragments inc. room for head page
  */
 struct skb_frag_walk {
 	uint fragi;
 	uint past;
 	uint total;
 	uint nr_frags;
+	uint initial_offset;
+	bool pp_recycle;
 	skb_frag_t frags[MAX_SKB_FRAGS+1];
 };
 
 /**
- * skb_prepare_frag_walk() - initialize a frag walk from an skb
- * @skb: initialize the walk over this skb
- * @initial_offset: start at @initial_offset into the walk
+ * skb_prepare_frag_walk() - initialize a frag walk over an skb.
+ * @skb: the skb to walk.
+ * @initial_offset: start the walk @initial_offset into the skb.
  * @walk: the walk to initialize
+ *
+ * Future calls to skb_add_frags() will expect the @offset value to be at
+ * least @initial_offset large.
  */
 static void skb_prepare_frag_walk(struct sk_buff *skb, uint initial_offset,
 				  struct skb_frag_walk *walk)
@@ -236,9 +242,12 @@ static void skb_prepare_frag_walk(struct sk_buff *skb, uint initial_offset,
 	skb_frag_t *frag, *from;
 	uint i;
 
+	walk->initial_offset = initial_offset;
 	walk->fragi = 0;
 	walk->past = 0;
+	walk->total = 0;
 	walk->nr_frags = 0;
+	walk->pp_recycle = skb->pp_recycle;
 
 	if (skb->head_frag) {
 		if (initial_offset >= skb_headlen(skb))
@@ -248,6 +257,7 @@ static void skb_prepare_frag_walk(struct sk_buff *skb, uint initial_offset,
 			skb_head_to_frag(skb, frag);
 			frag->bv_offset += initial_offset;
 			frag->bv_len -= initial_offset;
+			walk->total += frag->bv_len;
 			initial_offset = 0;
 		}
 	} else {
@@ -270,25 +280,14 @@ static void skb_prepare_frag_walk(struct sk_buff *skb, uint initial_offset,
 		}
 		walk->total += frag->bv_len;
 	}
+	BUG_ON(initial_offset != 0);
 }
 
-/**
- * skb_add_frags() - add a range of fragment references into an skb
- * @skb: skb to add references into
- * @walk: the walk to add referenced fragments from.
- * @offset: offset from beginning of walk to start from.
- * @len: amount of data to add frag references to in @skb.
- *
- * Return: the amount of @len left un-added; if non-zero then the walk
- * will be completed.
- */
-static uint skb_add_frags(struct sk_buff *skb, struct skb_frag_walk *walk, uint offset, uint len)
+static uint __skb_reset_frag_walk(struct skb_frag_walk *walk, uint offset)
 {
-	struct skb_shared_info *shinfo = skb_shinfo(skb);
-	uint fraglen;
-
-	if (!walk->nr_frags || offset > walk->total)
-		return len;
+	/* Adjust offset to refer to internal walk values */
+	BUG_ON(offset < walk->initial_offset);
+	offset -= walk->initial_offset;
 
 	/* Get to the correct fragment for offset */
 	while (offset < walk->past) {
@@ -302,6 +301,76 @@ static uint skb_add_frags(struct sk_buff *skb, struct skb_frag_walk *walk, uint 
 
 	/* offset now relative to this current frag */
 	offset -= walk->past;
+	return offset;
+}
+
+/**
+ * skb_can_add_frags() - check if ok to add frags from walk to skb
+ * @skb: skb to check for adding frags to
+ * @walk: the walk that will be used as source for frags.
+ * @offset: offset from beginning of original skb to start from.
+ * @len: amount of data to add frag references to in @skb.
+ */
+static bool skb_can_add_frags(const struct sk_buff *skb, struct skb_frag_walk *walk, uint offset, uint len)
+{
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+	uint fragi, nr_frags, fraglen;
+
+	if (skb_has_frag_list(skb) || skb->pp_recycle != walk->pp_recycle)
+		return false;
+
+	/* Make offset relative to current frag after setting that */
+	offset = __skb_reset_frag_walk(walk, offset);
+
+	/* Verify we have array space for the fragments we need to add */
+	fragi = walk->fragi;
+	nr_frags  = shinfo->nr_frags;
+	while (len && fragi < walk->nr_frags) {
+		skb_frag_t *frag = &walk->frags[fragi];
+
+		fraglen = frag->bv_len;
+		if (offset) {
+			fraglen -= offset;
+			offset = 0;
+		}
+		if (++nr_frags > MAX_SKB_FRAGS)
+			return false;
+		if (len <= fraglen)
+			return true;
+		len -= fraglen;
+		fragi++;
+	}
+	/* We may not copy all @len but what we have will fit. */
+	return true;
+}
+
+/**
+* skb_add_frags() - add a range of fragment references into an skb
+* @skb: skb to add references into
+* @walk: the walk to add referenced fragments from.
+* @offset: offset from beginning of original skb to start from.
+* @len: amount of data to add frag references to in @skb.
+*
+* skb_can_add_frags() should be called before this function to verify that the
+* destination @skb is compatible with the walk and has space in the array for
+* the to be added frag refrences.
+*
+* Return: The number of bytes not added to @skb b/c we reached the end of the
+* walk before adding all of @len.
+*/
+static int skb_add_frags(struct sk_buff *skb, struct skb_frag_walk *walk,
+			 uint offset, uint len)
+{
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+	uint fraglen;
+
+	BUG_ON(skb->pp_recycle != walk->pp_recycle);
+	if (!walk->nr_frags || offset >= walk->total + walk->initial_offset)
+		return len;
+
+	/* make offset relative to current frag after setting that */
+	offset = __skb_reset_frag_walk(walk, offset);
+	BUG_ON(shinfo->nr_frags >= MAX_SKB_FRAGS);
 
 	while (len && walk->fragi < walk->nr_frags) {
 		skb_frag_t *frag = &walk->frags[walk->fragi];
@@ -315,6 +384,7 @@ static uint skb_add_frags(struct sk_buff *skb, struct skb_frag_walk *walk, uint 
 		}
 		__skb_frag_ref(tofrag);
 		shinfo->nr_frags++;
+		BUG_ON(shinfo->nr_frags > MAX_SKB_FRAGS);
 
 		/* see if we are done */
 		fraglen = tofrag->bv_len;
@@ -325,10 +395,11 @@ static uint skb_add_frags(struct sk_buff *skb, struct skb_frag_walk *walk, uint 
 			return 0;
 		}
 		/* advance to next source fragment */
-		len -= fraglen;			/* careful, use dst bv_len */
-		skb->len += fraglen;		/* careful, "   "    "     */
-		skb->data_len += fraglen;	/* careful, "   "    "     */
-		walk->past += frag->bv_len;	/* careful, use src bv_len */
+		len -= fraglen;		  /* careful, use dst bv_len */
+		skb->len += fraglen;	  /* careful, "   "    "     */
+		skb->data_len += fraglen; /* careful, "   "    "     */
+		walk->past +=
+			frag->bv_len; /* careful, use src bv_len */
 		walk->fragi++;
 	}
 	return len;
@@ -381,18 +452,17 @@ static int skb_copy_bits_seq(struct skb_seq_state *st, int offset, void *to, int
  * iptfs_pskb_add_frags() - Create and add frags into a new sk_buff.
  * @tpl: template to create new skb from.
  * @walk: The source for fragments to add.
- * @off: The offset into @walk to add frags from.
+ * @off: The offset into @walk to add frags from, also used with @st and
+ *       @copy_len.
  * @len: The length of data to add covering frags from @walk into @skb.
  *       This must be <= @skblen.
  * @st: The sequence state to copy from into the new head skb.
- * @copy_off: Offset to start copying @copy_len bytes from @st into new skb.
- * @copy_len: Copy @copy_len bytes from @st into the new skb linear space.
+ * @copy_len: Copy @copy_len bytes from @st at offset @off into the new skb
+ *            linear space.
  *
- * Create a new sk_buff `skb` with @skblen of packet data space. If non-zero,
- * copy @rlen bytes of @runt into `skb`. Then using seq functions copy @len
- * bytes from @st into `skb` starting from @off.
- *
- * It is an error for @len to be greater than the amount of data left in @st.
+ * Create a new sk_buff `skb` using the template @tpl. Copy @copy_len bytes from
+ * @st into the new skb linear space, and then add shared fragments from the
+ * frag walk for the remaining @len of data (i.e., @len - @copy_len bytes).
  *
  * Return: The newly allocated sk_buff `skb` or NULL if an error occurs.
  */
@@ -400,7 +470,6 @@ struct sk_buff *iptfs_pskb_add_frags(struct sk_buff *tpl,
 				     struct skb_frag_walk *walk,
 				     uint off, uint len,
 				     struct skb_seq_state *st,
-				     uint copy_off,
 				     uint copy_len)
 {
 	struct sk_buff *skb;
@@ -409,14 +478,21 @@ struct sk_buff *iptfs_pskb_add_frags(struct sk_buff *tpl,
 	if (!skb)
 		return NULL;
 
+	/* this should not normally be happening */
+	if (!skb_can_add_frags(skb, walk, off + copy_len, len - copy_len)) {
+		kfree_skb(skb);
+		return NULL;
+	}
+
 	if (copy_len &&
-	    skb_copy_bits_seq(st, copy_off, skb_put(skb, copy_len), copy_len)) {
+	    skb_copy_bits_seq(st, off, skb_put(skb, copy_len), copy_len)) {
 		XFRM_INC_STATS(dev_net(st->root_skb->dev),
 			       LINUX_MIB_XFRMINERROR);
 		kfree_skb(skb);
 		return NULL;
 	}
-	skb_add_frags(skb, walk, off, len);
+
+	skb_add_frags(skb, walk, off + copy_len, len - copy_len);
 	return skb;
 }
 
@@ -586,10 +662,12 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 			       struct skb_seq_state *st, struct sk_buff *skb,
 			       uint data, uint blkoff, struct list_head *list)
 {
+	struct skb_frag_walk _fragwalk;
+	struct skb_frag_walk *fragwalk = NULL;
 	struct sk_buff *newskb = xtfs->ra_newskb;
 	uint remaining = skb->len - data;
 	uint runtlen = xtfs->ra_runtlen;
-	uint copylen, fraglen, ipremain, rrem;
+	uint copylen, fraglen, ipremain, iphlen, iphremain, rrem;
 
 	/*
 	 * Handle packet fragment we aren't expecting
@@ -706,8 +784,11 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 	 * Continue reassembling the packet
 	 */
 	ipremain = __iptfs_iplen(newskb->data);
+	iphlen = __iptfs_iphlen(newskb->data);
 
-	/* we created the newskb knowing the length it can't now be shorter */
+	/* Sanity check, we created the newskb knowing the IP length so the IP
+	 * length can't now be shorter.
+	 */
 	BUG_ON(newskb->len > ipremain);
 
 	ipremain -= newskb->len;
@@ -717,37 +798,70 @@ static uint iptfs_reassem_cont(struct xfrm_iptfs_data *xtfs, u64 seq,
 		goto abandon;
 	}
 
+	/* We want the IP header in linear space */
+	if (newskb->len < iphlen)  {
+		iphremain = iphlen - newskb->len;
+		if (blkoff < iphremain) {
+			XFRM_INC_STATS(dev_net(skb->dev),
+				       LINUX_MIB_XFRMINIPTFSERROR);
+			goto abandon;
+		}
+		fraglen = min(blkoff, remaining);
+		copylen = min(fraglen, iphremain);
+		BUG_ON(skb_tailroom(newskb) < copylen);
+		if (skb_copy_bits_seq(st, data, skb_put(newskb, copylen), copylen)) {
+			XFRM_INC_STATS(dev_net(skb->dev),
+				       LINUX_MIB_XFRMINBUFFERERROR);
+			goto abandon;
+		}
+		/* this is a silly condition that might occur anyway */
+		if (copylen < iphremain) {
+			xtfs->ra_wantseq++;
+			return data + fraglen;
+		}
+		/* update data and things derived from it */
+		data += copylen;
+		blkoff -= copylen;
+		remaining -= copylen;
+		ipremain -= copylen;
+	}
+
 	fraglen = min(blkoff, remaining);
 	copylen = min(fraglen, ipremain);
 
-	/*
-	 * Now share or copy?
-	 */
-	if (false && !skb_has_frag_list(skb) && skb->head_frag &&
-	    !skb_has_frag_list(newskb) &&
-	    /* Large enough that it's worth sharing */
-	    ipremain + newskb->len >= IPTFS_PKT_SHARE_MIN &&
-	    /* We have the IP header right now */
-	    skb->len >= __iptfs_iphlen(newskb->data)) {
-		;
+	/* If we may have the opportunity to share prepare a fragwalk. */
+	if (!skb_has_frag_list(skb) && !skb_has_frag_list(newskb) &&
+	    (skb->head_frag || skb->len == skb->data_len) &&
+	    skb->pp_recycle == newskb->pp_recycle) {
+		fragwalk = &_fragwalk;
+		skb_prepare_frag_walk(skb, data, fragwalk);
+	}
+
+	/* Try share then copy. */
+	if (fragwalk && skb_can_add_frags(newskb, fragwalk, data, copylen)) {
+		uint leftover;
+		leftover = skb_add_frags(newskb, fragwalk, data, copylen);
+		BUG_ON(leftover != 0);
 	} else {
+		/* We verified this was true in the main receive routine */
 		BUG_ON(skb_tailroom(newskb) < copylen);
 
 		/* copy fragment data into newskb */
 		if (skb_copy_bits_seq(st, data, skb_put(newskb, copylen), copylen)) {
-			XFRM_INC_STATS(dev_net(skb->dev), LINUX_MIB_XFRMINBUFFERERROR);
+			XFRM_INC_STATS(dev_net(skb->dev),
+				       LINUX_MIB_XFRMINBUFFERERROR);
 			goto abandon;
 		}
+	}
 
-		if (copylen < ipremain)
-			xtfs->ra_wantseq++;
-		else {
-			/* We are done with packet reassembly! */
-			BUG_ON(copylen != ipremain);
-			iptfs_reassem_done(xtfs);
-			iptfs_complete_inner_skb(xtfs->x, newskb);
-			list_add_tail(&newskb->list, list);
-		}
+	if (copylen < ipremain)
+		xtfs->ra_wantseq++;
+	else {
+		/* We are done with packet reassembly! */
+		BUG_ON(copylen != ipremain);
+		iptfs_reassem_done(xtfs);
+		iptfs_complete_inner_skb(xtfs->x, newskb);
+		list_add_tail(&newskb->list, list);
 	}
 
 	/* will continue on to new data block or end */
@@ -906,7 +1020,7 @@ static int iptfs_input_ordered(struct xfrm_state *x, struct sk_buff *skb)
 			iplen = htons(iph->tot_len);
 			iphlen = iph->ihl << 2;
 			protocol = htons(ETH_P_IP);
-			XFRM_MODE_SKB_CB(skb)->tos = iph->tos;
+			XFRM_MODE_SKB_CB(skbseq.root_skb)->tos = iph->tos;
 		} else if (iph->version == 0x6) {
 			/* must have at least payload_len field present */
 			if (remaining < 6) {
@@ -921,7 +1035,7 @@ static int iptfs_input_ordered(struct xfrm_state *x, struct sk_buff *skb)
 			iplen += sizeof(struct ipv6hdr);
 			iphlen = sizeof(struct ipv6hdr);
 			protocol = htons(ETH_P_IPV6);
-			XFRM_MODE_SKB_CB(skb)->tos =
+			XFRM_MODE_SKB_CB(skbseq.root_skb)->tos =
 				ipv6_get_dsfield((struct ipv6hdr *)iph);
 		} else if (iph->version == 0x0) {
 			/* pad */
@@ -936,8 +1050,9 @@ static int iptfs_input_ordered(struct xfrm_state *x, struct sk_buff *skb)
 			/* We need to reset our seq read, it can't backup at
 			 * this point.
 			 */
+			struct sk_buff *save = skbseq.root_skb;
 			skb_abort_seq_read(&skbseq);
-			skb_prepare_seq_read(skb, data, tail, &skbseq);
+			skb_prepare_seq_read(save, data, tail, &skbseq);
 		}
 
 		if (first_skb)
@@ -948,35 +1063,68 @@ static int iptfs_input_ordered(struct xfrm_state *x, struct sk_buff *skb)
 			fragwalk = NULL;
 
 			/* We are going to skip over `data` bytes to reach the
-			 * IP header of `iphlen` len for `iplen` inner packet.
+			 * start of the IP header of `iphlen` len for `iplen`
+			 * inner packet.
 			 */
 
 			if (skb_has_frag_list(skb)) {
-				/* Too complex; just copy */
 				defer = skb;
 				skb = NULL;
-			} else if (false && skb->head_frag &&
-				   /* Large enough that it's worth sharing */
-				   iplen >= IPTFS_PKT_SHARE_MIN &&
-				   /* We have the IP header right now */
-				   remaining >= iphlen) {
-
-				/* Start the shared frag walk immediately after
-				 * the IP header, as we need to copy the IP
-				 * header into the skb linear space.
+#if 0
+			} else if (data < skb_headlen(skb)) {
+				/* NOTE: Instead of pskb_pull we could just drop
+				 * the head bytes and as many pages as necessary
+				 * to get us pointing at the correct thing.
 				 */
-				fragwalk = &_fragwalk;
-				skb_prepare_frag_walk(skb, data + iphlen, fragwalk);
-				skb = NULL;
-			} else if (skb->data_len == 0 && skb->len > data &&
-				   skb_tailroom(skb) + (skb->len - data) >= iplen) {
+				pskb_pull(skb, data);
 				/*
 				 * Reuse fist skb. Need to move past the initial
 				 * iptfs header as well as any initial fragment
-				 * for previous inner packet reassembly
+				 * for previous inner packet reassembly.
+				 */
+				skb_pull(skb, data);
+				data = 0;
+				tail = skb->len;
+				remaining = skb->len;
+
+				skb->protocol = protocol;
+				skb_mac_header_rebuild(skb);
+				if (skb->mac_len)
+					eth_hdr(skb)->h_proto = skb->protocol;
+
+				/* all pointers could be changed now -- reset walk */
+				skb_abort_seq_read(&skbseq);
+				skb_prepare_seq_read(skb, data, tail, &skbseq);
+
+			} else if (skb->data_len == 0 &&
+				   skb_tailroom(skb) + (skb->len - data) >= iplen) {
+#endif
+			} else if (data + iphlen <= skb_headlen(skb) &&
+				   /* make sure our header is 32-bit aligned? */
+				   /* ((uintptr_t)(skb->data + data) & 0x3) == 0 && */
+				   skb_tailroom(skb) + tail - data >= iplen) {
+				/* Reuse the received skb.
 				 *
-				 * The remaining tailroom will be used for
-				 * future fragment data for this packet.
+				 * We have enough headlen to pull past any
+				 * initial fragment data, leaving at least the
+				 * IP header in the linear buffer space.
+				 *
+				 * For linear buffer space we only require that
+				 * linear buffer space is large enough to
+				 * eventually hold the entire reassembled
+				 * packet (by including tailroom in the check).
+				 *
+				 * For non-linear tailroom is 0 and so we only
+				 * re-use if the entire packet is present
+				 * already.
+				 *
+				 * NOTE: there are many more options for
+				 * sharing, KISS for now. Also, this can produce
+				 * skb's with the IP header unaligned to 32
+				 * bits. If that ends up being a problem then a
+				 * check should be added to the conditional
+				 * above that the header lies on a 32-bit
+				 * boundary as well.
 				 */
 				skb_pull(skb, data);
 
@@ -990,25 +1138,20 @@ static int iptfs_input_ordered(struct xfrm_state *x, struct sk_buff *skb)
 				if (skb->mac_len)
 					eth_hdr(skb)->h_proto = skb->protocol;
 
-				/* We could have more iplen than remaining, if
-				 * the skb we received has extra tailroom that
-				 * wasn't used by the receiver, e.g., say the
-				 * skb has 4k total space, but a 1500 octet
-				 * inner IP packet starts 1000 into the payload
-				 * (because it is preceeded by a 1000 octet end
-				 * fragment) and the outer packet is 1500
-				 * octets, so the payload will be ~500 bytes
-				 * (remaining) of total iplen which of 1500. The
-				 * last 1000 octets will come in the next skb,
-				 * but we can copy that into the tail of this
-				 * skb b/c we have tailroom.
-				 */
-
 				/* all pointers could be changed now reset walk */
 				skb_abort_seq_read(&skbseq);
 				skb_prepare_seq_read(skb, data, tail, &skbseq);
+			} else if (skb->head_frag &&
+				   /* We have the IP header right now */
+				   remaining >= iphlen) {
+				fragwalk = &_fragwalk;
+				skb_prepare_frag_walk(skb, data, fragwalk);
+				defer = skb;
+				skb = NULL;
 			} else {
-				/* first skb didn't have enough space */
+				/* We couldn't reuse the input skb so allocate a
+				 * new one.
+				 */
 				defer = skb;
 				skb = NULL;
 			}
@@ -1020,15 +1163,17 @@ static int iptfs_input_ordered(struct xfrm_state *x, struct sk_buff *skb)
 
 		capturelen = min(iplen, remaining);
 		if (!skb) {
-			if (!fragwalk)
-				skb = iptfs_pskb_extract_seq(iplen, &skbseq, data,
-							     capturelen);
-			else {
-				BUG_ON(capturelen < iphlen);
-				capturelen -= iphlen;
-				skb = iptfs_pskb_add_frags(first_skb, fragwalk,
-							   0, capturelen,
-							   &skbseq, data, iphlen);
+			if (!fragwalk ||
+			    /* Large enough to be worth sharing */
+			    iplen < IPTFS_PKT_SHARE_MIN ||
+			    /* Have IP header + some data to share. */
+			    capturelen <= iphlen ||
+			    /* Try creating skb and adding frags */
+			    !(skb = iptfs_pskb_add_frags(first_skb, fragwalk,
+							 data, capturelen,
+							 &skbseq, iphlen))) {
+				skb = iptfs_pskb_extract_seq(iplen, &skbseq,
+							     data, capturelen);
 			}
 			if (!skb) {
 				/* skip to next packet or done */
@@ -1036,6 +1181,7 @@ static int iptfs_input_ordered(struct xfrm_state *x, struct sk_buff *skb)
 				continue;
 			}
 			BUG_ON(skb->len != capturelen);
+
 			skb->protocol = protocol;
 			if (old_mac) {
 				/* rebuild the mac header */
@@ -1050,7 +1196,6 @@ static int iptfs_input_ordered(struct xfrm_state *x, struct sk_buff *skb)
 
 		if (skb->len < iplen) {
 			BUG_ON(data != tail);
-			BUG_ON(fragwalk && data != fragwalk->total);
 			BUG_ON(xtfs->ra_newskb);
 
 			/*
@@ -2655,3 +2800,44 @@ static void __exit xfrm_iptfs_fini(void)
 module_init(xfrm_iptfs_init);
 module_exit(xfrm_iptfs_fini);
 MODULE_LICENSE("GPL");
+
+#if 0
+
+/* scratch pad for later */
+
+/*
+ * We have all page fragments we can refer to
+ * for packet data (skb->head_frag); -or-
+ *
+ * We have non-shareable head data, but we will
+ * move past it when skipping the
+ * IPTFS header and previous packet's fragment
+ * (blkoff) data; -or-
+ *
+ * We have non-shareable head data, but we can
+ * pull past the IPTFS header and initial
+ * fragment (blkoff) and re-use the remaining
+ * head data for part of the first IP packet.
+ */
+
+/* There are other things we can do see the
+   bottom of the file */
+/* /\* Or we can re-use the skb itself *\/ */
+/* (skb_headlen(skb) <= iphlen + data))) { */
+
+/* if (skb_headlen(skb) > data) { */
+/* 	skb_pull(skb, data); */
+/* 	data = 0; */
+/* 	tail = skb->tail; */
+/* 	remaining = tail; */
+/* 	skb->protocol = protocol; */
+/* 	/\* check for overlapping regions? *\/ */
+/* 	skb_mac_header_rebuild(skb); */
+/* 	if (skb->mac_len) */
+/* 		eth_hdr(skb)->h_proto = skb->protocol; */
+/* 	/\* Initialize the walk just after the */
+/* 	 * current IP packet data. */
+/* 	 *\/ */
+/* 	skb_prepare_frag_walk(skb, iplen - skb_headlen(skb), fragwalk); */
+/* } else */
+#endif
