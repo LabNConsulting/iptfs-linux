@@ -355,7 +355,7 @@ static bool skb_can_add_frags(const struct sk_buff *skb,
  *
  * skb_can_add_frags() should be called before this function to verify that the
  * destination @skb is compatible with the walk and has space in the array for
- * the to be added frag refrences.
+ * the to be added frag references.
  *
  * Return: The number of bytes not added to @skb b/c we reached the end of the
  * walk before adding all of @len.
@@ -647,7 +647,7 @@ static void __iptfs_reassem_done(struct xfrm_iptfs_data *xtfs, bool free)
 }
 
 /**
- * iptfs_reassem_done() - In-progress packet is aborted free the state.
+ * iptfs_reassem_abort() - In-progress packet is aborted free the state.
  * @xtfs: xtfs state
  */
 static void iptfs_reassem_abort(struct xfrm_iptfs_data *xtfs)
@@ -934,7 +934,7 @@ static int iptfs_input_ordered(struct xfrm_state *x, struct sk_buff *skb)
 	}
 	data = sizeof(*ipth);
 
-	trace_iptfs_egress_recv(skb, xtfs, htons(ipth->block_offset));
+	trace_iptfs_egress_recv(skb, xtfs, be16_to_cpu(ipth->block_offset));
 
 	/* Set data past the basic header */
 	if (ipth->subtype == IPTFS_SUBTYPE_CC) {
@@ -979,7 +979,7 @@ static int iptfs_input_ordered(struct xfrm_state *x, struct sk_buff *skb)
 	BUG_ON(xtfs->ra_newskb && data < tail);
 
 	while (data < tail) {
-		u32 protocol = 0;
+		__be16 protocol = 0;
 
 		/* Gather information on the next data block.
 		 * `data` points to the start of the data block.
@@ -1004,9 +1004,9 @@ static int iptfs_input_ordered(struct xfrm_state *x, struct sk_buff *skb)
 				break;
 			}
 
-			iplen = htons(iph->tot_len);
+			iplen = be16_to_cpu(iph->tot_len);
 			iphlen = iph->ihl << 2;
-			protocol = htons(ETH_P_IP);
+			protocol = cpu_to_be16(ETH_P_IP);
 			XFRM_MODE_SKB_CB(skbseq.root_skb)->tos = iph->tos;
 		} else if (iph->version == 0x6) {
 			/* must have at least payload_len field present */
@@ -1018,10 +1018,10 @@ static int iptfs_input_ordered(struct xfrm_state *x, struct sk_buff *skb)
 				break;
 			}
 
-			iplen = htons(((struct ipv6hdr *)hbytes)->payload_len);
+			iplen = be16_to_cpu(((struct ipv6hdr *)hbytes)->payload_len);
 			iplen += sizeof(struct ipv6hdr);
 			iphlen = sizeof(struct ipv6hdr);
-			protocol = htons(ETH_P_IPV6);
+			protocol = cpu_to_be16(ETH_P_IPV6);
 			XFRM_MODE_SKB_CB(skbseq.root_skb)->tos =
 				ipv6_get_dsfield((struct ipv6hdr *)iph);
 		} else if (iph->version == 0x0) {
@@ -2527,7 +2527,7 @@ static u32 __iptfs_get_inner_mtu(struct xfrm_state *x, int outer_mtu)
 }
 
 /**
- * iptfs_get_mtu() - return the inner MTU for an IPTFS xfrm.
+ * iptfs_get_inner_mtu() - return the inner MTU for an IPTFS xfrm.
  * @x: xfrm state.
  * @outer_mtu: Outer MTU for the encapsulated packet.
  *

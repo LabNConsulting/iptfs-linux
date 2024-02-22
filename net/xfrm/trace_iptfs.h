@@ -52,7 +52,7 @@ TRACE_EVENT(iptfs_egress_recv,
 			   __entry->head_pg_addr = page_address(virt_to_head_page(skb->head));
 			   __entry->pg0addr = (__entry->nr_frags
 					       ? page_address(skb_shinfo(skb)->frags[0].bv_page)
-					       : 0);
+					       : NULL);
 			   __entry->pg0off = (__entry->nr_frags
 					      ? skb_shinfo(skb)->frags[0].bv_offset
 					      : 0);
