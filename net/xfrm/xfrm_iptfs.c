@@ -2621,11 +2621,11 @@ static int iptfs_copy_to_user(struct xfrm_state *x, struct sk_buff *skb)
 	if (ret)
 		return ret;
 	ret = nla_put_u32(skb, XFRMA_IPTFS_DROP_TIME,
-			  xtfs->drop_time_ns / NSECS_IN_USEC);
+			  do_div(xtfs->drop_time_ns, NSECS_IN_USEC));
 	if (ret)
 		return ret;
 	ret = nla_put_u32(skb, XFRMA_IPTFS_INIT_DELAY,
-			  xtfs->init_delay_ns / NSECS_IN_USEC);
+			  do_div(xtfs->init_delay_ns, NSECS_IN_USEC));
 	return ret;
 }
 
