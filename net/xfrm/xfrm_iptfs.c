@@ -1420,7 +1420,7 @@ static u32 __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 	u64 wantseq = xtfs->w_wantseq;
 	struct sk_buff *slot0 = NULL;
 	u64 last_drop_seq = xtfs->w_wantseq;
-	u64 distance, extra_drops, missed, s0seq;
+	u64 distance, extra_drops, s0seq;
 	u32 count = 0;
 	struct skb_wseq *wnext;
 	u32 beyond, shifting, slot;
@@ -1429,7 +1429,6 @@ static u32 __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 	distance = inseq - wantseq;
 	BUG_ON(distance <= nslots - 1);
 	beyond = distance - (nslots - 1);
-	missed = 0;
 
 	/* Handle future sequence number received.
 	 *
@@ -1516,7 +1515,6 @@ static u32 __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 		/* handle what was in slot0 before we occupy it */
 		if (!slot0) {
 			last_drop_seq = s0seq;
-			missed++;
 		} else {
 			list_add_tail(&slot0->list, list);
 			count++;
@@ -1554,7 +1552,6 @@ static u32 __reorder_future_shifts(struct xfrm_iptfs_data *xtfs,
 			s0seq += extra_drops + 1;
 			count++;
 		}
-		missed += extra_drops;
 		slot0 = NULL;
 		/* slot0 has had an empty slot pushed into it */
 	}
