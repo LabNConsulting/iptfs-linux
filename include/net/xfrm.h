@@ -458,6 +458,7 @@ struct xfrm_mode_cbs {
 			     struct netlink_ext_ack *extack);
 	int	(*copy_to_user)(struct xfrm_state *x, struct sk_buff *skb);
 	int     (*clone)(struct xfrm_state *x, struct xfrm_state *orig);
+	unsigned int (*sa_len)(const struct xfrm_state *x);
 
 	u32	(*get_inner_mtu)(struct xfrm_state *x, int outer_mtu);
 
