@@ -2597,6 +2597,23 @@ static int iptfs_user_init(struct net *net, struct xfrm_state *x,
 	return 0;
 }
 
+static unsigned int iptfs_sa_len(const struct xfrm_state *x)
+{
+	struct xfrm_iptfs_data *xtfs = x->mode_data;
+	struct xfrm_iptfs_config *xc = &xtfs->cfg;
+	unsigned int l = 0;
+
+	if (xc->dont_frag)
+		l += nla_total_size(0);
+	l += nla_total_size(sizeof(xc->reorder_win_size));
+	l += nla_total_size(sizeof(xc->pkt_size));
+	l += nla_total_size(sizeof(xc->max_queue_size));
+	l += nla_total_size(sizeof(u32)); /* drop time usec */
+	l += nla_total_size(sizeof(u32)); /* init delay usec */
+
+	return l;
+}
+
 static int iptfs_copy_to_user(struct xfrm_state *x, struct sk_buff *skb)
 {
 	struct xfrm_iptfs_data *xtfs = x->mode_data;
@@ -2729,6 +2746,7 @@ static const struct xfrm_mode_cbs iptfs_mode_cbs = {
 	.delete_state = iptfs_delete_state,
 	.user_init = iptfs_user_init,
 	.copy_to_user = iptfs_copy_to_user,
+	.sa_len = iptfs_sa_len,
 	.clone = iptfs_clone,
 	.get_inner_mtu = iptfs_get_inner_mtu,
 	.input = iptfs_input,
