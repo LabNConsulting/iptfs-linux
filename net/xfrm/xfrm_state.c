@@ -1788,8 +1788,9 @@ static struct xfrm_state *xfrm_state_clone(struct xfrm_state *orig,
 	x->new_mapping = 0;
 	x->new_mapping_sport = 0;
 
+	x->mode_cbs = orig->mode_cbs;
 	if (x->mode_cbs && x->mode_cbs->clone) {
-		if (!x->mode_cbs->clone(x, orig))
+		if (x->mode_cbs->clone(x, orig))
 			goto error;
 	}
 
