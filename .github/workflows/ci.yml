@@ -165,14 +165,14 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y device-tree-compiler libelf-dev
 
-      - name: Buildroot Build Cache
-        id: buildroot-cache
-        uses: actions/cache@v4
-        with:
-          path: output-buildroot.tar.gz
-          key: ${{ runner.os }}-br-${{ hashFiles('buildroot.config', 'output-buildroot.tar.gz', 'root-key', 'root-key.pub') }}
-          restore-keys: |
-            key: ${{ runner.os }}-br-
+      # - name: Buildroot Build Cache
+      #   id: buildroot-cache
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: output-buildroot.tar.gz
+      #     key: ${{ runner.os }}-br-${{ hashFiles('buildroot.config', 'output-buildroot.tar.gz', 'root-key', 'root-key.pub') }}
+      #     restore-keys: |
+      #       key: ${{ runner.os }}-br-
 
       - name: Build Rootfs
         timeout-minutes: 540
@@ -213,14 +213,14 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-      - name: Collect cache contents
-        timeout-minutes: 120
-        run: |
-          # tar up the remaining files including .ccache
-          echo "Collecting new cache contents: $(date)"
-          tar -czvf output-buildroot.tar.gz output-buildroot root-key root-key.pub || echo "error with tarball creation"
-          ls -hl output-buildroot.tar.gz || true
-          echo "Done collecting new cache contents: $(date)"
+      # - name: Collect cache contents
+      #   timeout-minutes: 120
+      #   run: |
+      #     # tar up the remaining files including .ccache
+      #     echo "Collecting new cache contents: $(date)"
+      #     tar -czvf output-buildroot.tar.gz output-buildroot root-key root-key.pub || echo "error with tarball creation"
+      #     ls -hl output-buildroot.tar.gz || true
+      #     echo "Done collecting new cache contents: $(date)"
 
       - name: Archive buildroot rootfs.cpio.gz
         uses: actions/upload-artifact@v4
