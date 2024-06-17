@@ -2498,13 +2498,16 @@ static unsigned int iptfs_sa_len(const struct xfrm_state *x)
 	struct xfrm_iptfs_config *xc = &xtfs->cfg;
 	unsigned int l = 0;
 
-	if (xc->dont_frag)
-		l += nla_total_size(0);
-	l += nla_total_size(sizeof(xc->reorder_win_size));
-	l += nla_total_size(sizeof(xc->pkt_size));
-	l += nla_total_size(sizeof(xc->max_queue_size));
-	l += nla_total_size(sizeof(u32)); /* drop time usec */
-	l += nla_total_size(sizeof(u32)); /* init delay usec */
+	if (x->dir == XFRM_SA_DIR_IN) {
+		l += nla_total_size(sizeof(u32)); /* drop time usec */
+		l += nla_total_size(sizeof(xc->reorder_win_size));
+	} else {
+		if (xc->dont_frag)
+			l += nla_total_size(0);	  /* dont-frag flag */
+		l += nla_total_size(sizeof(u32)); /* init delay usec */
+		l += nla_total_size(sizeof(xc->max_queue_size));
+		l += nla_total_size(sizeof(xc->pkt_size));
+	}
 
 	return l;
 }
@@ -2516,30 +2519,35 @@ static int iptfs_copy_to_user(struct xfrm_state *x, struct sk_buff *skb)
 	int ret;
 	u64 q;
 
-	if (xc->dont_frag) {
-		ret = nla_put_flag(skb, XFRMA_IPTFS_DONT_FRAG);
+	if (x->dir == XFRM_SA_DIR_IN) {
+		q = xtfs->drop_time_ns;
+		(void)do_div(q, NSECS_IN_USEC);
+		ret = nla_put_u32(skb, XFRMA_IPTFS_DROP_TIME, q);
 		if (ret)
 			return ret;
+
+		ret = nla_put_u16(skb, XFRMA_IPTFS_REORDER_WINDOW,
+				  xc->reorder_win_size);
+	} else {
+		if (xc->dont_frag) {
+			ret = nla_put_flag(skb, XFRMA_IPTFS_DONT_FRAG);
+			if (ret)
+				return ret;
+		}
+
+		q = xtfs->init_delay_ns;
+		(void)do_div(q, NSECS_IN_USEC);
+		ret = nla_put_u32(skb, XFRMA_IPTFS_INIT_DELAY, q);
+		if (ret)
+			return ret;
+
+		ret = nla_put_u32(skb, XFRMA_IPTFS_MAX_QSIZE,
+				  xc->max_queue_size);
+		if (ret)
+			return ret;
+
+		ret = nla_put_u32(skb, XFRMA_IPTFS_PKT_SIZE, xc->pkt_size);
 	}
-	ret = nla_put_u16(skb, XFRMA_IPTFS_REORDER_WINDOW, xc->reorder_win_size);
-	if (ret)
-		return ret;
-	ret = nla_put_u32(skb, XFRMA_IPTFS_PKT_SIZE, xc->pkt_size);
-	if (ret)
-		return ret;
-	ret = nla_put_u32(skb, XFRMA_IPTFS_MAX_QSIZE, xc->max_queue_size);
-	if (ret)
-		return ret;
-
-	q = xtfs->drop_time_ns;
-	(void)do_div(q, NSECS_IN_USEC);
-	ret = nla_put_u32(skb, XFRMA_IPTFS_DROP_TIME, q);
-	if (ret)
-		return ret;
-
-	q = xtfs->init_delay_ns;
-	(void)do_div(q, NSECS_IN_USEC);
-	ret = nla_put_u32(skb, XFRMA_IPTFS_INIT_DELAY, q);
 
 	return ret;
 }
