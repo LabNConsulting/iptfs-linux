@@ -298,6 +298,38 @@ jobs:
           sudo -E env CI=$CI python3 -m pytest -s --coverage --cov-build-dir=$PWD/output-linux tests/errors |& tee $tmpf
           grep -qvz SKIPPED $tmpf
 
+      - name: Floog/Aggregation test
+        run: |
+          set -e
+          set -o pipefail
+          tmpf=test-logs/results-flood.txt
+          sudo -E env CI=$CI python3 -m pytest -s --coverage --cov-build-dir=$PWD/output-linux tests/flood |& tee $tmpf
+          grep -qvz SKIPPED $tmpf
+
+      - name: Fragment test
+        run: |
+          set -e
+          set -o pipefail
+          tmpf=test-logs/results-frags.txt
+          sudo -E env CI=$CI python3 -m pytest -s --coverage --cov-build-dir=$PWD/output-linux tests/frags |& tee $tmpf
+          grep -qvz SKIPPED $tmpf
+
+      - name: MTU test
+        run: |
+          set -e
+          set -o pipefail
+          tmpf=test-logs/results-mtu.txt
+          sudo -E env CI=$CI python3 -m pytest -s --coverage --cov-build-dir=$PWD/output-linux tests/mtu |& tee $tmpf
+          grep -qvz SKIPPED $tmpf
+
+      - name: Reorder test
+        run: |
+          set -e
+          set -o pipefail
+          tmpf=test-logs/results-reorder.txt
+          sudo -E env CI=$CI python3 -m pytest -s --coverage --cov-build-dir=$PWD/output-linux tests/reorder |& tee $tmpf
+          grep -qvz SKIPPED $tmpf
+
       - name: Simple test
         run: |
           set -e
@@ -312,7 +344,7 @@ jobs:
           set -e
           set -o pipefail
           tmpf=test-logs/results-utpkt.txt
-          sudo python3 -m pytest -s --coverage --cov-build-dir=$PWD/output-linux tests/utpkt |& tee $tmpf
+          sudo -E env CI=$CI python3 -m pytest -s --coverage --cov-build-dir=$PWD/output-linux tests/utpkt |& tee $tmpf
           grep -qvz SKIPPED $tmpf
 
       - name: Extract coverage data
